@@ -17,8 +17,8 @@ def load_data():
     df_d1 = df_d1.rename(columns={'units': 'd-1_units', 'amount': 'd-1_revenue'})
 
     # Extract date from the timestamp for filtering
-    df_d1['unit_creation_timestamp'] = pd.to_datetime(df_d1['unit_creation_timestamp'])
-    df_d1['date'] = df_d1['unit_creation_timestamp'].dt.date
+
+    df_d1['date'] = pd.to_datetime(df_d1['unit_creation_timestamp'].astype(str).str.split('T').str[0]).dt.date
 
     return df_ja, df_d1
 
