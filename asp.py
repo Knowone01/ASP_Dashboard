@@ -147,6 +147,18 @@ brand_pivot['Disc %'] = ((brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_A
 
 # 7. UI Dashboard Layout with Navigable Tabs
 # (.round(2) replaces Styler: same 2-decimal display, far lighter on memory)
+def style_pivot(df):
+    """2-decimal display; Disc % cells red if negative, green otherwise."""
+    def color_disc(v):
+        if v < 0:
+            return "background-color: #f8d7da; color: #842029"
+        return "background-color: #d1e7dd; color: #0f5132"
+
+    styler = df.style.format(precision=2)
+    apply_cells = styler.map if hasattr(styler, "map") else styler.applymap
+    return apply_cells(color_disc, subset=["Disc %"])
+
+
 tab1, tab2, tab3 = st.tabs(["Basefile Data", "Seller Level Pivot", "Brand Level Pivot"])
 
 with tab1:
@@ -155,8 +167,8 @@ with tab1:
 
 with tab2:
     st.subheader("ASP Fixed by JA Units - Seller Level")
-    st.dataframe(seller_pivot.round(2), use_container_width=True)
+    st.dataframe(style_pivot(seller_pivot), use_container_width=True)
 
 with tab3:
     st.subheader("ASP Fixed by JA Units - Brand Level")
-    st.dataframe(brand_pivot.round(2), use_container_width=True)
+    st.dataframe(style_pivot(brand_pivot), use_container_width=True)
