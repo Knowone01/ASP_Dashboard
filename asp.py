@@ -18,36 +18,45 @@ def load_data():
     id_cols = ['listing_id', 'seller_id', 'seller_name', 'brand']
     str_dtype = {c: str for c in id_cols}
 
-    # Only read the columns that are actually used; read everything as text first
-    # so mixed-type columns don't break, then convert numerics explicitly.
+    # --- JA file ---
     df_ja = pd.read_csv(
         "lid_JA.csv",
         usecols=id_cols + ['units', 'gmv'],
         dtype={**str_dtype, 'units': str, 'gmv': str},
         low_memory=False,
     )
-    df_d1 = pd.read_csv(
+    for c in ['units', 'gmv']:
+        df_ja[c] = to_num(df_ja[c])
+    df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
+
+    # --- d-1 file: read in chunks and pre-sum per listing/seller/brand/date ---
+    # (only this small summary is kept in memory, never the raw rows)
+    parts = []
+    reader = pd.read_csv(
         "lid_d-1.csv",
         usecols=id_cols + ['unit_creation_timestamp', 'units', 'amount'],
         dtype={**str_dtype, 'unit_creation_timestamp': str, 'units': str, 'amount': str},
-        low_memory=False,
+        chunksize=100_000,
     )
-
-    # Numeric conversion
-    for c in ['units', 'gmv']:
-        df_ja[c] = to_num(df_ja[c])
-    for c in ['units', 'amount']:
-        df_d1[c] = to_num(df_d1[c])
-
-    # Rename columns to match the standard
-    df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
+    for chunk in reader:
+        chunk['units'] = to_num(chunk['units'])
+        chunk['amount'] = to_num(chunk['amount'])
+        chunk['date'] = chunk['unit_creation_timestamp'].str.split('T').str[0]
+        chunk = chunk.drop(columns=['unit_creation_timestamp'])
+        parts.append(
+            chunk.groupby(id_cols + ['date'], as_index=False).agg(
+                {'units': 'sum', 'amount': 'sum'}
+            )
+        )
+    df_d1 = pd.concat(parts, ignore_index=True)
+    df_d1 = df_d1.groupby(id_cols + ['date'], as_index=False).agg(
+        {'units': 'sum', 'amount': 'sum'}
+    )
     df_d1 = df_d1.rename(columns={'units': 'd-1_units', 'amount': 'd-1_revenue'})
 
-    # Extract date from the timestamp for filtering
-    df_d1['date'] = pd.to_datetime(
-        df_d1['unit_creation_timestamp'].str.split('T').str[0], errors='coerce'
-    ).dt.date
-    df_d1 = df_d1.dropna(subset=['date']).drop(columns=['unit_creation_timestamp'])
+    # Convert the date text to real dates (done on the small summary table)
+    df_d1['date'] = pd.to_datetime(df_d1['date'], errors='coerce').dt.date
+    df_d1 = df_d1.dropna(subset=['date'])
 
     return df_ja, df_d1
 
