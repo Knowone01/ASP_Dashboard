@@ -66,19 +66,40 @@ df_ja, df_d1 = load_data()
 # 2. Sidebar Date Filter
 st.sidebar.header("Filters")
 available_dates = sorted(df_d1['date'].unique())
-selected_dates = st.sidebar.multiselect(
-    "Select Date(s) from d-1:",
-    options=available_dates,
-    default=available_dates
-)
-
-# Stop execution if no dates are selected
-if not selected_dates:
-    st.warning("Please select at least one date from the sidebar.")
+if not available_dates:
+    st.error("No valid dates found in the d-1 data.")
     st.stop()
 
+with st.sidebar.form("date_filter_form"):
+    start_input = st.selectbox(
+        "Start Date (d-1):",
+        options=available_dates,
+        index=0
+    )
+    end_input = st.selectbox(
+        "End Date (d-1):",
+        options=available_dates,
+        index=len(available_dates) - 1
+    )
+    refresh = st.form_submit_button("Refresh Data")
+
+# Apply the selected range only when the button is clicked
+if refresh:
+    if start_input > end_input:
+        st.sidebar.warning("Start Date must be on or before End Date.")
+    else:
+        st.session_state['applied_range'] = (start_input, end_input)
+
+# Nothing is calculated until the first click
+if 'applied_range' not in st.session_state:
+    st.info("Select a Start Date and End Date in the sidebar, then click **Refresh Data**.")
+    st.stop()
+
+start_date, end_date = st.session_state['applied_range']
+st.caption(f"Showing d-1 data from {start_date} to {end_date}")
+
 # 3. Filter and Aggregate d-1 Data
-df_d1_filtered = df_d1[df_d1['date'].isin(selected_dates)]
+df_d1_filtered = df_d1[(df_d1['date'] >= start_date) & (df_d1['date'] <= end_date)]
 df_d1_agg = df_d1_filtered.groupby(['listing_id', 'seller_id', 'seller_name', 'brand'], as_index=False).agg(
     {'d-1_units': 'sum', 'd-1_revenue': 'sum'}
 )
