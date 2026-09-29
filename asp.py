@@ -132,6 +132,7 @@ seller_pivot = basefile.groupby(['seller_id', 'seller_name']).agg(
 
 seller_pivot['Fixed_JA_ASP'] = (seller_pivot['Sum_JA_ASP_x_JA_units'] / seller_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
 seller_pivot['Fixed_d-1_ASP'] = (seller_pivot['Sum_d1_ASP_x_JA_units'] / seller_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
+seller_pivot['Disc %'] = ((seller_pivot['Fixed_d-1_ASP'] / seller_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 # 6. Create Brand Level Pivot
 brand_pivot = basefile.groupby(['brand']).agg(
@@ -142,6 +143,7 @@ brand_pivot = basefile.groupby(['brand']).agg(
 
 brand_pivot['Fixed_JA_ASP'] = (brand_pivot['Sum_JA_ASP_x_JA_units'] / brand_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
 brand_pivot['Fixed_d-1_ASP'] = (brand_pivot['Sum_d1_ASP_x_JA_units'] / brand_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
+brand_pivot['Disc %'] = ((brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 # 7. UI Dashboard Layout with Navigable Tabs
 # (.round(2) replaces Styler: same 2-decimal display, far lighter on memory)
