@@ -1,4 +1,4 @@
-import gc
+mport gc
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,7 +15,7 @@ def normalize(columns):
     return columns.str.strip().str.lower().str.replace(' ', '_', regex=False)
 
 
-@st.cache_resource          # single shared object across sessions — no copies
+@st.cache_resource
 def load_data():
     id_cols    = ['listing_id', 'seller_id', 'seller_name', 'brand']
     extra_cols = ['super_category', 'vertical', 'alpha_flag']
@@ -34,15 +34,12 @@ def load_data():
 
     # ── d-1: peek header → exact usecols ─────────────────────────────────────
     _peek    = pd.read_csv("lid_d-1.csv", nrows=0)
-    _col_map = dict(zip(normalize(_peek.columns), _peek.columns))  # norm → actual
+    _col_map = dict(zip(normalize(_peek.columns), _peek.columns))
 
     needed      = id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
     usecols_act = [_col_map[n] for n in needed if n in _col_map]
     rename_map  = {_col_map[n]: n for n in needed if n in _col_map}
 
-    # Two compact structures built in one pass:
-    #   d1_parts  → (listing_id, date, units, amount)          lean fact table
-    #   meta_parts → (listing_id + id_cols + extra_cols)        one row per LID
     d1_parts, meta_parts = [], []
 
     for chunk in pd.read_csv(
@@ -62,7 +59,6 @@ def load_data():
             chunk[id_cols + extra_cols].drop_duplicates('listing_id')
         )
 
-    # ── df_d1: compact fact table (listing_id, date, units, revenue) ──────────
     df_d1 = pd.concat(d1_parts, ignore_index=True)
     del d1_parts; gc.collect()
 
@@ -74,7 +70,6 @@ def load_data():
     df_d1['d-1_revenue'] = df_d1['d-1_revenue'].astype('float32')
     df_d1.dropna(subset=['date'], inplace=True)
 
-    # ── lid_meta: one row per listing_id, all attributes ─────────────────────
     lid_meta = (pd.concat(meta_parts, ignore_index=True)
                   .drop_duplicates('listing_id')
                   .reset_index(drop=True))
@@ -134,8 +129,7 @@ df_d1_agg = (
 )
 
 
-# ── Basefile: merge on listing_id (inner = common LIDs) ──────────────────────
-# df_ja already carries seller_id, seller_name, brand — no need to store in df_d1
+# ── Basefile ──────────────────────────────────────────────────────────────────
 basefile = pd.merge(df_ja, df_d1_agg, on='listing_id', how='inner')
 
 basefile['JA_ASP'] = (
@@ -156,7 +150,7 @@ basefile_display = basefile[[
 ]]
 
 
-# ── LID attrs for date-level tab: common LIDs from lid_meta + Lookup ─────────
+# ── LID attrs ────────────────────────────────────────────────────────────────
 common_lids = set(basefile['listing_id'])
 
 lid_attrs = (
@@ -164,7 +158,6 @@ lid_attrs = (
     .copy()
     .reset_index(drop=True)
 )
-# astype(str) to safely operate on category columns
 lid_attrs['Brand_Tag']  = lid_attrs['brand'].astype(str).map(_lookup_map).fillna('Unbranded')
 lid_attrs['alpha_flag'] = lid_attrs['alpha_flag'].astype(str).str.strip()
 
@@ -229,7 +222,7 @@ def style_date_disc(df, label_col):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs(
-    ['Basefile Data', 'Seller Level Pivot', 'Brand Level Pivot', 'Input ASP Disc%']
+    ['Basefile Data', 'Seller Level Pivot', 'Brand Level Pivot', 'Date-Level Disc%']
 )
 
 with tab1:
@@ -259,7 +252,7 @@ with tab4:
     else:
         _ja_ref = (
             basefile[basefile['listing_id'].isin(valid_lids)]
-            [['listing_id', 'JA_units', 'JA_ASP']]
+            [['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue']]
             .drop_duplicates('listing_id')
         )
 
@@ -289,7 +282,7 @@ with tab4:
             df_dated['d1w'] = df_dated['d-1_ASP'] * df_dated['JA_units']
             df_dated['jaw'] = df_dated['JA_ASP']   * df_dated['JA_units']
 
-            def make_disc_pivot(group_col, label_col):
+            def make_disc_pivot(group_col, label_col, sort_by_gmv=False):
                 sub = df_dated.dropna(subset=[group_col])
                 sub = sub[sub[group_col] != 'nan']
                 if sub.empty:
@@ -303,10 +296,20 @@ with tab4:
                 pivot = agg.pivot(index=group_col, columns='date', values='Disc%')
                 pivot.columns = [str(c) for c in pivot.columns]
                 pivot.columns.name = None
-                return pivot.reset_index().rename(columns={group_col: label_col})
+                pivot = pivot.reset_index().rename(columns={group_col: label_col})
+
+                if sort_by_gmv:
+                    gmv_order = (sub.groupby(group_col)['JA_revenue']
+                                    .sum()
+                                    .reset_index()
+                                    .rename(columns={group_col: label_col})
+                                    .sort_values('JA_revenue', ascending=False))
+                    pivot = gmv_order[[label_col]].merge(pivot, on=label_col, how='left')
+
+                return pivot
 
             sc_pivot = make_disc_pivot('super_category', 'Super Category')
-            v_pivot  = make_disc_pivot('vertical', 'Vertical')
+            v_pivot  = make_disc_pivot('vertical', 'Vertical', sort_by_gmv=True)
 
             if not sc_pivot.empty:
                 st.markdown('**Super Category**')
@@ -324,5 +327,6 @@ with tab4:
 
         st.caption(
             'Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100, weighted by JA units  ·  '
-            'Common LIDs · Non-Alpha · Unbranded only'
+            'Common LIDs · Non-Alpha · Unbranded only  ·  '
+            'Verticals sorted by JA GMV descending'
         )
