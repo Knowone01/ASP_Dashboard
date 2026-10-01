@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# Set page layout
 st.set_page_config(page_title="LID Level ASP Dashboard", layout="wide")
 st.title("LID Level ASP Analysis Dashboard")
 
@@ -12,11 +11,11 @@ def to_num(s):
     return pd.to_numeric(s.str.replace(",", "", regex=False), errors="coerce")
 
 
-# 1. Load Data (cached once, shared across sessions -> no per-rerun copies)
 @st.cache_resource
 def load_data():
     id_cols = ['listing_id', 'seller_id', 'seller_name', 'brand']
-    str_dtype = {c: str for c in id_cols}
+    extra_cols = ['super_category', 'vertical', 'alpha_flag']
+    str_dtype = {c: str for c in id_cols + extra_cols}
 
     # --- JA file ---
     df_ja = pd.read_csv(
@@ -29,12 +28,11 @@ def load_data():
         df_ja[c] = to_num(df_ja[c])
     df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
 
-    # --- d-1 file: read in chunks and pre-sum per listing/seller/brand/date ---
-    # (only this small summary is kept in memory, never the raw rows)
+    # --- d-1 file: read in chunks, pre-sum per listing/seller/brand/date ---
     parts = []
     reader = pd.read_csv(
         "lid_d-1.csv",
-        usecols=id_cols + ['unit_creation_timestamp', 'units', 'amount'],
+        usecols=id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount'],
         dtype={**str_dtype, 'unit_creation_timestamp': str, 'units': str, 'amount': str},
         chunksize=100_000,
     )
@@ -44,26 +42,45 @@ def load_data():
         chunk['date'] = chunk['unit_creation_timestamp'].str.split('T').str[0]
         chunk = chunk.drop(columns=['unit_creation_timestamp'])
         parts.append(
-            chunk.groupby(id_cols + ['date'], as_index=False).agg(
+            chunk.groupby(id_cols + extra_cols + ['date'], as_index=False).agg(
                 {'units': 'sum', 'amount': 'sum'}
             )
         )
     df_d1 = pd.concat(parts, ignore_index=True)
-    df_d1 = df_d1.groupby(id_cols + ['date'], as_index=False).agg(
+    df_d1 = df_d1.groupby(id_cols + extra_cols + ['date'], as_index=False).agg(
         {'units': 'sum', 'amount': 'sum'}
     )
     df_d1 = df_d1.rename(columns={'units': 'd-1_units', 'amount': 'd-1_revenue'})
-
-    # Convert the date text to real dates (done on the small summary table)
     df_d1['date'] = pd.to_datetime(df_d1['date'], errors='coerce').dt.date
     df_d1 = df_d1.dropna(subset=['date'])
 
-    return df_ja, df_d1
+    # --- Lookup file: Brand -> Brand_Tag ---
+    df_lookup = pd.read_csv("Lookup.csv", dtype=str)
+    df_lookup.columns = df_lookup.columns.str.strip()
+    df_lookup['Brand'] = df_lookup['Brand'].str.strip()
+    df_lookup['Brand_Tag'] = df_lookup['Brand_Tag'].str.strip()
+
+    return df_ja, df_d1, df_lookup
 
 
-df_ja, df_d1 = load_data()
+df_ja, df_d1, df_lookup = load_data()
 
-# 2. Sidebar Date Filter
+# Listing-level attributes from d-1 (take first row per listing_id, date-independent)
+_lookup_map = df_lookup.drop_duplicates('Brand').set_index('Brand')['Brand_Tag']
+
+lid_attrs = (
+    df_d1[['listing_id', 'brand', 'super_category', 'vertical', 'alpha_flag']]
+    .drop_duplicates(subset=['listing_id'])
+    .copy()
+)
+lid_attrs['alpha_flag'] = lid_attrs['alpha_flag'].str.strip()
+lid_attrs['super_category'] = lid_attrs['super_category'].str.strip()
+lid_attrs['vertical'] = lid_attrs['vertical'].str.strip()
+# Map Brand_Tag; brands not found in Lookup are labelled Unbranded
+lid_attrs['Brand_Tag'] = lid_attrs['brand'].map(_lookup_map).fillna('Unbranded')
+
+
+# ── Sidebar Date Filter ────────────────────────────────────────────────────────
 st.sidebar.header("Filters")
 available_dates = sorted(df_d1['date'].unique())
 if not available_dates:
@@ -71,26 +88,18 @@ if not available_dates:
     st.stop()
 
 with st.sidebar.form("date_filter_form"):
-    start_input = st.selectbox(
-        "Start Date (d-1):",
-        options=available_dates,
-        index=0
-    )
+    start_input = st.selectbox("Start Date (d-1):", options=available_dates, index=0)
     end_input = st.selectbox(
-        "End Date (d-1):",
-        options=available_dates,
-        index=len(available_dates) - 1
+        "End Date (d-1):", options=available_dates, index=len(available_dates) - 1
     )
     refresh = st.form_submit_button("Refresh Data")
 
-# Apply the selected range only when the button is clicked
 if refresh:
     if start_input > end_input:
         st.sidebar.warning("Start Date must be on or before End Date.")
     else:
         st.session_state['applied_range'] = (start_input, end_input)
 
-# Nothing is calculated until the first click
 if 'applied_range' not in st.session_state:
     st.info("Select a Start Date and End Date in the sidebar, then click **Refresh Data**.")
     st.stop()
@@ -98,55 +107,94 @@ if 'applied_range' not in st.session_state:
 start_date, end_date = st.session_state['applied_range']
 st.caption(f"Showing d-1 data from {start_date} to {end_date}")
 
-# 3. Filter and Aggregate d-1 Data
-df_d1_filtered = df_d1[(df_d1['date'] >= start_date) & (df_d1['date'] <= end_date)]
-df_d1_agg = df_d1_filtered.groupby(['listing_id', 'seller_id', 'seller_name', 'brand'], as_index=False).agg(
-    {'d-1_units': 'sum', 'd-1_revenue': 'sum'}
+
+# ── Filter & Aggregate d-1 ────────────────────────────────────────────────────
+df_d1_filtered = df_d1[
+    (df_d1['date'] >= start_date) & (df_d1['date'] <= end_date)
+]
+df_d1_agg = df_d1_filtered.groupby(
+    ['listing_id', 'seller_id', 'seller_name', 'brand'], as_index=False
+).agg({'d-1_units': 'sum', 'd-1_revenue': 'sum'})
+
+
+# ── Basefile ──────────────────────────────────────────────────────────────────
+basefile = pd.merge(
+    df_ja, df_d1_agg,
+    on=['listing_id', 'seller_id', 'seller_name', 'brand'],
+    how='inner'
 )
 
-# 4. Create the Basefile
-basefile = pd.merge(df_ja, df_d1_agg, on=['listing_id', 'seller_id', 'seller_name', 'brand'], how='inner')
-
-# Perform required calculations (inf from divide-by-zero treated like NaN -> 0)
-basefile['JA_ASP'] = (basefile['JA_revenue'] / basefile['JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
-basefile['d-1_ASP'] = (basefile['d-1_revenue'] / basefile['d-1_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-# Calculate weighted metrics fixing JA_units
+basefile['JA_ASP'] = (
+    (basefile['JA_revenue'] / basefile['JA_units'])
+    .replace([np.inf, -np.inf], np.nan).fillna(0)
+)
+basefile['d-1_ASP'] = (
+    (basefile['d-1_revenue'] / basefile['d-1_units'])
+    .replace([np.inf, -np.inf], np.nan).fillna(0)
+)
 basefile['JA_ASP*JA_units'] = basefile['JA_ASP'] * basefile['JA_units']
 basefile['d-1_ASP*JA_units'] = basefile['d-1_ASP'] * basefile['JA_units']
 
-# Keep only the requested columns for the basefile display
 base_columns = [
     'listing_id', 'seller_id', 'seller_name', 'brand',
     'JA_revenue', 'JA_units', 'd-1_revenue', 'd-1_units',
-    'JA_ASP', 'd-1_ASP', 'JA_ASP*JA_units', 'd-1_ASP*JA_units'
+    'JA_ASP', 'd-1_ASP', 'JA_ASP*JA_units', 'd-1_ASP*JA_units',
 ]
 basefile_display = basefile[base_columns]
 
-# 5. Create Seller Level Pivot
+
+# ── Seller Pivot ──────────────────────────────────────────────────────────────
 seller_pivot = basefile.groupby(['seller_id', 'seller_name']).agg(
     Total_JA_units=('JA_units', 'sum'),
     Sum_JA_ASP_x_JA_units=('JA_ASP*JA_units', 'sum'),
-    Sum_d1_ASP_x_JA_units=('d-1_ASP*JA_units', 'sum')
+    Sum_d1_ASP_x_JA_units=('d-1_ASP*JA_units', 'sum'),
 ).reset_index()
 
-seller_pivot['Fixed_JA_ASP'] = (seller_pivot['Sum_JA_ASP_x_JA_units'] / seller_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
-seller_pivot['Fixed_d-1_ASP'] = (seller_pivot['Sum_d1_ASP_x_JA_units'] / seller_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
-seller_pivot['Disc %'] = ((seller_pivot['Fixed_d-1_ASP'] / seller_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
+seller_pivot['Fixed_JA_ASP'] = (
+    (seller_pivot['Sum_JA_ASP_x_JA_units'] / seller_pivot['Total_JA_units'])
+    .replace([np.inf, -np.inf], np.nan).fillna(0)
+)
+seller_pivot['Fixed_d-1_ASP'] = (
+    (seller_pivot['Sum_d1_ASP_x_JA_units'] / seller_pivot['Total_JA_units'])
+    .replace([np.inf, -np.inf], np.nan).fillna(0)
+)
+seller_pivot['Disc %'] = (
+    (seller_pivot['Fixed_d-1_ASP'] / seller_pivot['Fixed_JA_ASP'] - 1) * 100
+).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-# 6. Create Brand Level Pivot
+
+# ── Brand Pivot ───────────────────────────────────────────────────────────────
 brand_pivot = basefile.groupby(['brand']).agg(
     Total_JA_units=('JA_units', 'sum'),
     Sum_JA_ASP_x_JA_units=('JA_ASP*JA_units', 'sum'),
-    Sum_d1_ASP_x_JA_units=('d-1_ASP*JA_units', 'sum')
+    Sum_d1_ASP_x_JA_units=('d-1_ASP*JA_units', 'sum'),
 ).reset_index()
 
-brand_pivot['Fixed_JA_ASP'] = (brand_pivot['Sum_JA_ASP_x_JA_units'] / brand_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
-brand_pivot['Fixed_d-1_ASP'] = (brand_pivot['Sum_d1_ASP_x_JA_units'] / brand_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
-brand_pivot['Disc %'] = ((brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
+brand_pivot['Fixed_JA_ASP'] = (
+    (brand_pivot['Sum_JA_ASP_x_JA_units'] / brand_pivot['Total_JA_units'])
+    .replace([np.inf, -np.inf], np.nan).fillna(0)
+)
+brand_pivot['Fixed_d-1_ASP'] = (
+    (brand_pivot['Sum_d1_ASP_x_JA_units'] / brand_pivot['Total_JA_units'])
+    .replace([np.inf, -np.inf], np.nan).fillna(0)
+)
+brand_pivot['Disc %'] = (
+    (brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_ASP'] - 1) * 100
+).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-# 7. UI Dashboard Layout with Navigable Tabs
-# (.round(2) replaces Styler: same 2-decimal display, far lighter on memory)
+
+# ── Valid LIDs for Date-Level Tab ─────────────────────────────────────────────
+# Common LIDs (in basefile) that are Non-Alpha AND Unbranded
+valid_lids = set(
+    lid_attrs[
+        lid_attrs['listing_id'].isin(basefile['listing_id']) &
+        (lid_attrs['alpha_flag'] == 'Non-Alpha') &
+        (lid_attrs['Brand_Tag'] == 'Unbranded')
+    ]['listing_id']
+)
+
+
+# ── Shared Styler ─────────────────────────────────────────────────────────────
 def style_pivot(df):
     """2-decimal display; Disc % cells red if negative, green otherwise."""
     def color_disc(v):
@@ -159,7 +207,29 @@ def style_pivot(df):
     return apply_cells(color_disc, subset=["Disc %"])
 
 
-tab1, tab2, tab3 = st.tabs(["Basefile Data", "Seller Level Pivot", "Brand Level Pivot"])
+def style_date_disc(df):
+    """Color all date columns: negative = red, positive/zero = green."""
+    date_cols = [c for c in df.columns if c not in ('Super Category', 'Vertical')]
+
+    def color(v):
+        try:
+            return (
+                "background-color: #f8d7da; color: #842029"
+                if float(v) < 0
+                else "background-color: #d1e7dd; color: #0f5132"
+            )
+        except (TypeError, ValueError):
+            return ""
+
+    s = df.style.format({c: "{:.2f}" for c in date_cols})
+    fn = s.map if hasattr(s, "map") else s.applymap
+    return fn(color, subset=date_cols)
+
+
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Basefile Data", "Seller Level Pivot", "Brand Level Pivot", "Date-Level Disc%"]
+)
 
 with tab1:
     st.subheader("Basefile (Filtered by Date)")
@@ -172,3 +242,93 @@ with tab2:
 with tab3:
     st.subheader("ASP Fixed by JA Units - Brand Level")
     st.dataframe(style_pivot(brand_pivot), use_container_width=True)
+
+with tab4:
+    st.subheader("Date-Level Disc% — Non-Alpha + Unbranded Common LIDs")
+
+    if not valid_lids:
+        st.warning(
+            "No listings match the Non-Alpha + Unbranded filter for the selected date range. "
+            "Check that `alpha_flag` values in the d-1 file are exactly 'Non-Alpha' "
+            "and that Lookup.csv covers the relevant brands."
+        )
+    else:
+        # Join d-1 daily rows with JA reference ASP/units for valid LIDs only
+        _ja_ref = (
+            basefile[basefile['listing_id'].isin(valid_lids)]
+            [['listing_id', 'JA_units', 'JA_ASP']]
+            .drop_duplicates('listing_id')
+        )
+
+        df_dated = (
+            df_d1[
+                df_d1['listing_id'].isin(valid_lids) &
+                (df_d1['date'] >= start_date) &
+                (df_d1['date'] <= end_date)
+            ]
+            .merge(_ja_ref, on='listing_id', how='inner')
+            .merge(
+                lid_attrs[['listing_id', 'super_category', 'vertical']],
+                on='listing_id', how='left'
+            )
+        )
+
+        if df_dated.empty:
+            st.info("No d-1 data for the selected date range after applying filters.")
+        else:
+            # Per-row weighted components
+            df_dated['d-1_ASP'] = (
+                (df_dated['d-1_revenue'] / df_dated['d-1_units'])
+                .replace([np.inf, -np.inf], np.nan).fillna(0)
+            )
+            df_dated['d1w'] = df_dated['d-1_ASP'] * df_dated['JA_units']
+            df_dated['jaw'] = df_dated['JA_ASP'] * df_dated['JA_units']
+
+            def make_disc_pivot(group_col, display_name):
+                """
+                Build a wide disc% table: rows = group_col values, cols = dates.
+                Returns (DataFrame, str) — the pivot and its display name.
+                """
+                sub = df_dated.dropna(subset=[group_col])
+                if sub.empty:
+                    return pd.DataFrame(), display_name
+
+                agg = sub.groupby([group_col, 'date']).agg(
+                    jaw=('jaw', 'sum'),
+                    d1w=('d1w', 'sum'),
+                    ju=('JA_units', 'sum'),
+                ).reset_index()
+
+                agg['Fixed_JA_ASP'] = (agg['jaw'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
+                agg['Fixed_d1_ASP'] = (agg['d1w'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
+                agg['Disc%'] = (
+                    (agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100
+                ).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+                pivot = agg.pivot(index=group_col, columns='date', values='Disc%')
+                pivot.columns = [str(c) for c in pivot.columns]
+                pivot.columns.name = None
+                pivot = pivot.reset_index().rename(columns={group_col: display_name})
+                return pivot, display_name
+
+            sc_pivot, sc_name = make_disc_pivot('super_category', 'Super Category')
+            v_pivot, v_name = make_disc_pivot('vertical', 'Vertical')
+
+            if not sc_pivot.empty:
+                st.markdown("**Super Category**")
+                st.dataframe(style_date_disc(sc_pivot), use_container_width=True)
+            else:
+                st.info("No super_category data available for this filter.")
+
+            st.divider()
+
+            if not v_pivot.empty:
+                st.markdown("**Vertical**")
+                st.dataframe(style_date_disc(v_pivot), use_container_width=True)
+            else:
+                st.info("No vertical data available for this filter.")
+
+        st.caption(
+            "Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100, weighted by JA units  ·  "
+            "Common LIDs · Non-Alpha · Unbranded only"
+        )
