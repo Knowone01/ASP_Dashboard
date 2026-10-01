@@ -1,3 +1,4 @@
+import gc
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,8 +11,11 @@ def to_num(s):
     return pd.to_numeric(s.str.replace(",", "", regex=False), errors="coerce")
 
 
-# cache_data (not cache_resource) so a code change busts the old cache
-@st.cache_data
+def normalize(columns):
+    return columns.str.strip().str.lower().str.replace(' ', '_', regex=False)
+
+
+@st.cache_resource          # single shared object across sessions — no copies
 def load_data():
     id_cols    = ['listing_id', 'seller_id', 'seller_name', 'brand']
     extra_cols = ['super_category', 'vertical', 'alpha_flag']
@@ -23,39 +27,62 @@ def load_data():
         dtype=str,
         low_memory=False,
     )
-    df_ja['units'] = to_num(df_ja['units'])
-    df_ja['gmv']   = to_num(df_ja['gmv'])
+    df_ja.columns = normalize(df_ja.columns)
+    df_ja['units'] = to_num(df_ja['units']).astype('float32')
+    df_ja['gmv']   = to_num(df_ja['gmv']).astype('float32')
     df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
 
-    # ── d-1 ───────────────────────────────────────────────────────────────────
-    # Read ALL columns per chunk, normalize names immediately, then slim down.
-    # Avoids any usecols mismatch and busts prior cached versions cleanly.
-    keep = id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
+    # ── d-1: peek header → exact usecols ─────────────────────────────────────
+    _peek    = pd.read_csv("lid_d-1.csv", nrows=0)
+    _col_map = dict(zip(normalize(_peek.columns), _peek.columns))  # norm → actual
 
-    parts = []
-    for chunk in pd.read_csv("lid_d-1.csv", dtype=str, chunksize=100_000):
-        # Normalize: strip whitespace, lowercase, spaces→underscores
-        chunk.columns = (chunk.columns
-                         .str.strip()
-                         .str.lower()
-                         .str.replace(' ', '_', regex=False))
-        # Keep only what we need (ignore any unrecognised columns)
-        chunk = chunk[[c for c in keep if c in chunk.columns]].copy()
-        chunk['units']  = to_num(chunk['units'])
-        chunk['amount'] = to_num(chunk['amount'])
+    needed      = id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
+    usecols_act = [_col_map[n] for n in needed if n in _col_map]
+    rename_map  = {_col_map[n]: n for n in needed if n in _col_map}
+
+    # Two compact structures built in one pass:
+    #   d1_parts  → (listing_id, date, units, amount)          lean fact table
+    #   meta_parts → (listing_id + id_cols + extra_cols)        one row per LID
+    d1_parts, meta_parts = [], []
+
+    for chunk in pd.read_csv(
+        "lid_d-1.csv", usecols=usecols_act, dtype=str, chunksize=100_000
+    ):
+        chunk = chunk.rename(columns=rename_map)
+        chunk['units']  = to_num(chunk['units']).astype('float32')
+        chunk['amount'] = to_num(chunk['amount']).astype('float32')
         chunk['date']   = chunk['unit_creation_timestamp'].str.split('T').str[0]
         chunk.drop(columns=['unit_creation_timestamp'], inplace=True)
-        parts.append(
-            chunk.groupby(id_cols + extra_cols + ['date'], as_index=False)
+
+        d1_parts.append(
+            chunk.groupby(['listing_id', 'date'], as_index=False)
                  .agg({'units': 'sum', 'amount': 'sum'})
         )
+        meta_parts.append(
+            chunk[id_cols + extra_cols].drop_duplicates('listing_id')
+        )
 
-    df_d1 = pd.concat(parts, ignore_index=True)
-    df_d1 = (df_d1.groupby(id_cols + extra_cols + ['date'], as_index=False)
+    # ── df_d1: compact fact table (listing_id, date, units, revenue) ──────────
+    df_d1 = pd.concat(d1_parts, ignore_index=True)
+    del d1_parts; gc.collect()
+
+    df_d1 = (df_d1.groupby(['listing_id', 'date'], as_index=False)
                   .agg({'units': 'sum', 'amount': 'sum'}))
     df_d1 = df_d1.rename(columns={'units': 'd-1_units', 'amount': 'd-1_revenue'})
-    df_d1['date'] = pd.to_datetime(df_d1['date'], errors='coerce').dt.date
+    df_d1['date']        = pd.to_datetime(df_d1['date'], errors='coerce').dt.date
+    df_d1['d-1_units']   = df_d1['d-1_units'].astype('float32')
+    df_d1['d-1_revenue'] = df_d1['d-1_revenue'].astype('float32')
     df_d1.dropna(subset=['date'], inplace=True)
+
+    # ── lid_meta: one row per listing_id, all attributes ─────────────────────
+    lid_meta = (pd.concat(meta_parts, ignore_index=True)
+                  .drop_duplicates('listing_id')
+                  .reset_index(drop=True))
+    del meta_parts; gc.collect()
+
+    for col in id_cols + extra_cols:
+        if col in lid_meta.columns:
+            lid_meta[col] = lid_meta[col].str.strip().astype('category')
 
     # ── Lookup ────────────────────────────────────────────────────────────────
     df_lookup = pd.read_csv("Lookup.csv", dtype=str)
@@ -63,10 +90,10 @@ def load_data():
     df_lookup['Brand']     = df_lookup['Brand'].str.strip()
     df_lookup['Brand_Tag'] = df_lookup['Brand_Tag'].str.strip()
 
-    return df_ja, df_d1, df_lookup
+    return df_ja, df_d1, lid_meta, df_lookup
 
 
-df_ja, df_d1, df_lookup = load_data()
+df_ja, df_d1, lid_meta, df_lookup = load_data()
 
 _lookup_map = df_lookup.drop_duplicates('Brand').set_index('Brand')['Brand_Tag']
 
@@ -99,19 +126,18 @@ start_date, end_date = st.session_state['applied_range']
 st.caption(f"Showing d-1 data from {start_date} to {end_date}")
 
 
-# ── d-1 aggregate (date range) ────────────────────────────────────────────────
-df_d1_filtered = df_d1[(df_d1['date'] >= start_date) & (df_d1['date'] <= end_date)]
-df_d1_agg = (df_d1_filtered
-             .groupby(['listing_id', 'seller_id', 'seller_name', 'brand'], as_index=False)
-             .agg({'d-1_units': 'sum', 'd-1_revenue': 'sum'}))
-
-
-# ── Basefile (common LIDs = inner join) ───────────────────────────────────────
-basefile = pd.merge(
-    df_ja, df_d1_agg,
-    on=['listing_id', 'seller_id', 'seller_name', 'brand'],
-    how='inner'
+# ── d-1 aggregate across date range ──────────────────────────────────────────
+df_d1_agg = (
+    df_d1[(df_d1['date'] >= start_date) & (df_d1['date'] <= end_date)]
+    .groupby('listing_id', as_index=False)
+    .agg({'d-1_units': 'sum', 'd-1_revenue': 'sum'})
 )
+
+
+# ── Basefile: merge on listing_id (inner = common LIDs) ──────────────────────
+# df_ja already carries seller_id, seller_name, brand — no need to store in df_d1
+basefile = pd.merge(df_ja, df_d1_agg, on='listing_id', how='inner')
+
 basefile['JA_ASP'] = (
     (basefile['JA_revenue'] / basefile['JA_units'])
     .replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -123,78 +149,59 @@ basefile['d-1_ASP'] = (
 basefile['JA_ASP*JA_units']  = basefile['JA_ASP']  * basefile['JA_units']
 basefile['d-1_ASP*JA_units'] = basefile['d-1_ASP'] * basefile['JA_units']
 
-base_columns = [
+basefile_display = basefile[[
     'listing_id', 'seller_id', 'seller_name', 'brand',
     'JA_revenue', 'JA_units', 'd-1_revenue', 'd-1_units',
     'JA_ASP', 'd-1_ASP', 'JA_ASP*JA_units', 'd-1_ASP*JA_units',
-]
-basefile_display = basefile[base_columns]
+]]
 
 
-# ── LID attrs: common LIDs only, sourced from d-1 + Lookup ───────────────────
+# ── LID attrs for date-level tab: common LIDs from lid_meta + Lookup ─────────
 common_lids = set(basefile['listing_id'])
 
 lid_attrs = (
-    df_d1[df_d1['listing_id'].isin(common_lids)]
-    [['listing_id', 'brand', 'super_category', 'vertical', 'alpha_flag']]
-    .drop_duplicates(subset=['listing_id'])
+    lid_meta[lid_meta['listing_id'].isin(common_lids)]
     .copy()
+    .reset_index(drop=True)
 )
-for col in ['brand', 'alpha_flag', 'super_category', 'vertical']:
-    lid_attrs[col] = lid_attrs[col].str.strip()
-
-lid_attrs['Brand_Tag'] = lid_attrs['brand'].map(_lookup_map).fillna('Unbranded')
+# astype(str) to safely operate on category columns
+lid_attrs['Brand_Tag']  = lid_attrs['brand'].astype(str).map(_lookup_map).fillna('Unbranded')
+lid_attrs['alpha_flag'] = lid_attrs['alpha_flag'].astype(str).str.strip()
 
 valid_lids = set(
     lid_attrs[
         (lid_attrs['alpha_flag'] == 'Non-Alpha') &
-        (lid_attrs['Brand_Tag'] == 'Unbranded')
+        (lid_attrs['Brand_Tag']  == 'Unbranded')
     ]['listing_id']
 )
 
 
 # ── Seller Pivot ──────────────────────────────────────────────────────────────
-seller_pivot = (basefile
-    .groupby(['seller_id', 'seller_name'])
+seller_pivot = (
+    basefile.groupby(['seller_id', 'seller_name'])
     .agg(
         Total_JA_units       =('JA_units',         'sum'),
         Sum_JA_ASP_x_JA_units=('JA_ASP*JA_units',  'sum'),
         Sum_d1_ASP_x_JA_units=('d-1_ASP*JA_units', 'sum'),
-    ).reset_index())
-
-seller_pivot['Fixed_JA_ASP'] = (
-    (seller_pivot['Sum_JA_ASP_x_JA_units'] / seller_pivot['Total_JA_units'])
-    .replace([np.inf, -np.inf], np.nan).fillna(0)
+    ).reset_index()
 )
-seller_pivot['Fixed_d-1_ASP'] = (
-    (seller_pivot['Sum_d1_ASP_x_JA_units'] / seller_pivot['Total_JA_units'])
-    .replace([np.inf, -np.inf], np.nan).fillna(0)
-)
-seller_pivot['Disc %'] = (
-    (seller_pivot['Fixed_d-1_ASP'] / seller_pivot['Fixed_JA_ASP'] - 1) * 100
-).replace([np.inf, -np.inf], np.nan).fillna(0)
+seller_pivot['Fixed_JA_ASP']  = (seller_pivot['Sum_JA_ASP_x_JA_units'] / seller_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
+seller_pivot['Fixed_d-1_ASP'] = (seller_pivot['Sum_d1_ASP_x_JA_units'] / seller_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
+seller_pivot['Disc %'] = ((seller_pivot['Fixed_d-1_ASP'] / seller_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
 # ── Brand Pivot ───────────────────────────────────────────────────────────────
-brand_pivot = (basefile
-    .groupby(['brand'])
+brand_pivot = (
+    basefile.groupby(['brand'])
     .agg(
         Total_JA_units       =('JA_units',         'sum'),
         Sum_JA_ASP_x_JA_units=('JA_ASP*JA_units',  'sum'),
         Sum_d1_ASP_x_JA_units=('d-1_ASP*JA_units', 'sum'),
-    ).reset_index())
-
-brand_pivot['Fixed_JA_ASP'] = (
-    (brand_pivot['Sum_JA_ASP_x_JA_units'] / brand_pivot['Total_JA_units'])
-    .replace([np.inf, -np.inf], np.nan).fillna(0)
+    ).reset_index()
 )
-brand_pivot['Fixed_d-1_ASP'] = (
-    (brand_pivot['Sum_d1_ASP_x_JA_units'] / brand_pivot['Total_JA_units'])
-    .replace([np.inf, -np.inf], np.nan).fillna(0)
-)
-brand_pivot['Disc %'] = (
-    (brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_ASP'] - 1) * 100
-).replace([np.inf, -np.inf], np.nan).fillna(0)
+brand_pivot['Fixed_JA_ASP']  = (brand_pivot['Sum_JA_ASP_x_JA_units'] / brand_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
+brand_pivot['Fixed_d-1_ASP'] = (brand_pivot['Sum_d1_ASP_x_JA_units'] / brand_pivot['Total_JA_units']).replace([np.inf, -np.inf], np.nan).fillna(0)
+brand_pivot['Disc %'] = ((brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
 # ── Stylers ───────────────────────────────────────────────────────────────────
@@ -240,18 +247,15 @@ with tab3:
 with tab4:
     st.subheader('Date-Level Disc% — Non-Alpha + Unbranded Common LIDs')
 
-    # Debug expander: always visible so column issues are easy to spot
-    with st.expander('Debug info'):
-        st.write('d-1 columns:', df_d1.columns.tolist())
-        st.write('alpha_flag unique values:', lid_attrs['alpha_flag'].unique().tolist())
-        st.write('Brand_Tag unique values:', lid_attrs['Brand_Tag'].unique().tolist())
-        st.write('valid_lids count:', len(valid_lids))
-
     if not valid_lids:
         st.warning(
             "No listings match Non-Alpha + Unbranded. "
-            "Check the debug info above for actual alpha_flag and Brand_Tag values."
+            "Check that alpha_flag in d-1 is exactly 'Non-Alpha' "
+            "and Lookup.csv covers the relevant brands."
         )
+        with st.expander("Debug"):
+            st.write("alpha_flag values:", lid_attrs['alpha_flag'].unique().tolist())
+            st.write("Brand_Tag values:",  lid_attrs['Brand_Tag'].unique().tolist())
     else:
         _ja_ref = (
             basefile[basefile['listing_id'].isin(valid_lids)]
@@ -266,8 +270,13 @@ with tab4:
                 (df_d1['date'] <= end_date)
             ]
             .merge(_ja_ref, on='listing_id', how='inner')
-            .merge(lid_attrs[['listing_id', 'super_category', 'vertical']],
-                   on='listing_id', how='left')
+            .merge(
+                lid_attrs[['listing_id', 'super_category', 'vertical']].assign(
+                    super_category=lid_attrs['super_category'].astype(str),
+                    vertical=lid_attrs['vertical'].astype(str),
+                ),
+                on='listing_id', how='left'
+            )
         )
 
         if df_dated.empty:
@@ -282,6 +291,7 @@ with tab4:
 
             def make_disc_pivot(group_col, label_col):
                 sub = df_dated.dropna(subset=[group_col])
+                sub = sub[sub[group_col] != 'nan']
                 if sub.empty:
                     return pd.DataFrame()
                 agg = (sub.groupby([group_col, 'date'])
@@ -289,9 +299,7 @@ with tab4:
                           .reset_index())
                 agg['Fixed_JA_ASP'] = (agg['jaw'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
                 agg['Fixed_d1_ASP'] = (agg['d1w'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
-                agg['Disc%'] = (
-                    (agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100
-                ).replace([np.inf, -np.inf], np.nan).fillna(0)
+                agg['Disc%'] = ((agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
                 pivot = agg.pivot(index=group_col, columns='date', values='Disc%')
                 pivot.columns = [str(c) for c in pivot.columns]
                 pivot.columns.name = None
