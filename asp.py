@@ -15,25 +15,25 @@ def to_num(s):
 def load_data():
     id_cols = ['listing_id', 'seller_id', 'seller_name', 'brand']
     extra_cols = ['super_category', 'vertical', 'alpha_flag']
-    str_dtype = {c: str for c in id_cols + extra_cols}
 
-    # --- JA file ---
+    # --- JA file: only id_cols + units + gmv, nothing else ---
     df_ja = pd.read_csv(
         "lid_JA.csv",
         usecols=id_cols + ['units', 'gmv'],
-        dtype={**str_dtype, 'units': str, 'gmv': str},
+        dtype={c: str for c in id_cols + ['units', 'gmv']},
         low_memory=False,
     )
     for c in ['units', 'gmv']:
         df_ja[c] = to_num(df_ja[c])
     df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
 
-    # --- d-1 file: read in chunks, pre-sum per listing/seller/brand/date ---
+    # --- d-1 file: id_cols + extra_cols + date + units + amount ---
+    d1_str_dtype = {c: str for c in id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']}
     parts = []
     reader = pd.read_csv(
         "lid_d-1.csv",
         usecols=id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount'],
-        dtype={**str_dtype, 'unit_creation_timestamp': str, 'units': str, 'amount': str},
+        dtype=d1_str_dtype,
         chunksize=100_000,
     )
     for chunk in reader:
@@ -54,7 +54,7 @@ def load_data():
     df_d1['date'] = pd.to_datetime(df_d1['date'], errors='coerce').dt.date
     df_d1 = df_d1.dropna(subset=['date'])
 
-    # --- Lookup file: Brand -> Brand_Tag ---
+    # --- Lookup: Brand -> Brand_Tag ---
     df_lookup = pd.read_csv("Lookup.csv", dtype=str)
     df_lookup.columns = df_lookup.columns.str.strip()
     df_lookup['Brand'] = df_lookup['Brand'].str.strip()
@@ -65,19 +65,7 @@ def load_data():
 
 df_ja, df_d1, df_lookup = load_data()
 
-# Listing-level attributes from d-1 (take first row per listing_id, date-independent)
 _lookup_map = df_lookup.drop_duplicates('Brand').set_index('Brand')['Brand_Tag']
-
-lid_attrs = (
-    df_d1[['listing_id', 'brand', 'super_category', 'vertical', 'alpha_flag']]
-    .drop_duplicates(subset=['listing_id'])
-    .copy()
-)
-lid_attrs['alpha_flag'] = lid_attrs['alpha_flag'].str.strip()
-lid_attrs['super_category'] = lid_attrs['super_category'].str.strip()
-lid_attrs['vertical'] = lid_attrs['vertical'].str.strip()
-# Map Brand_Tag; brands not found in Lookup are labelled Unbranded
-lid_attrs['Brand_Tag'] = lid_attrs['brand'].map(_lookup_map).fillna('Unbranded')
 
 
 # ── Sidebar Date Filter ────────────────────────────────────────────────────────
@@ -108,7 +96,7 @@ start_date, end_date = st.session_state['applied_range']
 st.caption(f"Showing d-1 data from {start_date} to {end_date}")
 
 
-# ── Filter & Aggregate d-1 ────────────────────────────────────────────────────
+# ── Filter & Aggregate d-1 (date range) ──────────────────────────────────────
 df_d1_filtered = df_d1[
     (df_d1['date'] >= start_date) & (df_d1['date'] <= end_date)
 ]
@@ -117,7 +105,7 @@ df_d1_agg = df_d1_filtered.groupby(
 ).agg({'d-1_units': 'sum', 'd-1_revenue': 'sum'})
 
 
-# ── Basefile ──────────────────────────────────────────────────────────────────
+# ── Basefile: inner join → common LIDs established here ──────────────────────
 basefile = pd.merge(
     df_ja, df_d1_agg,
     on=['listing_id', 'seller_id', 'seller_name', 'brand'],
@@ -141,6 +129,30 @@ base_columns = [
     'JA_ASP', 'd-1_ASP', 'JA_ASP*JA_units', 'd-1_ASP*JA_units',
 ]
 basefile_display = basefile[base_columns]
+
+
+# ── LID attributes: common LIDs only, sourced from d-1 + Lookup ──────────────
+common_lids = set(basefile['listing_id'])
+
+lid_attrs = (
+    df_d1[df_d1['listing_id'].isin(common_lids)]
+    [['listing_id', 'brand', 'super_category', 'vertical', 'alpha_flag']]
+    .drop_duplicates(subset=['listing_id'])
+    .copy()
+)
+lid_attrs['alpha_flag'] = lid_attrs['alpha_flag'].str.strip()
+lid_attrs['super_category'] = lid_attrs['super_category'].str.strip()
+lid_attrs['vertical'] = lid_attrs['vertical'].str.strip()
+# Brand_Tag from Lookup; brands absent in Lookup → Unbranded
+lid_attrs['Brand_Tag'] = lid_attrs['brand'].map(_lookup_map).fillna('Unbranded')
+
+# Valid LIDs for date-level tab: Non-Alpha + Unbranded
+valid_lids = set(
+    lid_attrs[
+        (lid_attrs['alpha_flag'] == 'Non-Alpha') &
+        (lid_attrs['Brand_Tag'] == 'Unbranded')
+    ]['listing_id']
+)
 
 
 # ── Seller Pivot ──────────────────────────────────────────────────────────────
@@ -183,34 +195,19 @@ brand_pivot['Disc %'] = (
 ).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
-# ── Valid LIDs for Date-Level Tab ─────────────────────────────────────────────
-# Common LIDs (in basefile) that are Non-Alpha AND Unbranded
-valid_lids = set(
-    lid_attrs[
-        lid_attrs['listing_id'].isin(basefile['listing_id']) &
-        (lid_attrs['alpha_flag'] == 'Non-Alpha') &
-        (lid_attrs['Brand_Tag'] == 'Unbranded')
-    ]['listing_id']
-)
-
-
-# ── Shared Styler ─────────────────────────────────────────────────────────────
+# ── Shared Stylers ────────────────────────────────────────────────────────────
 def style_pivot(df):
-    """2-decimal display; Disc % cells red if negative, green otherwise."""
     def color_disc(v):
         if v < 0:
             return "background-color: #f8d7da; color: #842029"
         return "background-color: #d1e7dd; color: #0f5132"
-
     styler = df.style.format(precision=2)
-    apply_cells = styler.map if hasattr(styler, "map") else styler.applymap
-    return apply_cells(color_disc, subset=["Disc %"])
+    fn = styler.map if hasattr(styler, "map") else styler.applymap
+    return fn(color_disc, subset=["Disc %"])
 
 
-def style_date_disc(df):
-    """Color all date columns: negative = red, positive/zero = green."""
-    date_cols = [c for c in df.columns if c not in ('Super Category', 'Vertical')]
-
+def style_date_disc(df, label_col):
+    date_cols = [c for c in df.columns if c != label_col]
     def color(v):
         try:
             return (
@@ -220,7 +217,6 @@ def style_date_disc(df):
             )
         except (TypeError, ValueError):
             return ""
-
     s = df.style.format({c: "{:.2f}" for c in date_cols})
     fn = s.map if hasattr(s, "map") else s.applymap
     return fn(color, subset=date_cols)
@@ -248,18 +244,19 @@ with tab4:
 
     if not valid_lids:
         st.warning(
-            "No listings match the Non-Alpha + Unbranded filter for the selected date range. "
-            "Check that `alpha_flag` values in the d-1 file are exactly 'Non-Alpha' "
-            "and that Lookup.csv covers the relevant brands."
+            "No listings match the Non-Alpha + Unbranded filter. "
+            "Check that `alpha_flag` in d-1 is exactly 'Non-Alpha' "
+            "and Lookup.csv covers the relevant brands."
         )
     else:
-        # Join d-1 daily rows with JA reference ASP/units for valid LIDs only
+        # JA reference (ASP + units) for valid LIDs only
         _ja_ref = (
             basefile[basefile['listing_id'].isin(valid_lids)]
             [['listing_id', 'JA_units', 'JA_ASP']]
             .drop_duplicates('listing_id')
         )
 
+        # Daily d-1 rows for valid LIDs in selected date range
         df_dated = (
             df_d1[
                 df_d1['listing_id'].isin(valid_lids) &
@@ -276,57 +273,49 @@ with tab4:
         if df_dated.empty:
             st.info("No d-1 data for the selected date range after applying filters.")
         else:
-            # Per-row weighted components
             df_dated['d-1_ASP'] = (
                 (df_dated['d-1_revenue'] / df_dated['d-1_units'])
                 .replace([np.inf, -np.inf], np.nan).fillna(0)
             )
+            # Weighted components for fixed ASP calculation
             df_dated['d1w'] = df_dated['d-1_ASP'] * df_dated['JA_units']
             df_dated['jaw'] = df_dated['JA_ASP'] * df_dated['JA_units']
 
-            def make_disc_pivot(group_col, display_name):
-                """
-                Build a wide disc% table: rows = group_col values, cols = dates.
-                Returns (DataFrame, str) — the pivot and its display name.
-                """
+            def make_disc_pivot(group_col, label_col):
                 sub = df_dated.dropna(subset=[group_col])
                 if sub.empty:
-                    return pd.DataFrame(), display_name
-
+                    return pd.DataFrame()
                 agg = sub.groupby([group_col, 'date']).agg(
                     jaw=('jaw', 'sum'),
                     d1w=('d1w', 'sum'),
                     ju=('JA_units', 'sum'),
                 ).reset_index()
-
                 agg['Fixed_JA_ASP'] = (agg['jaw'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
                 agg['Fixed_d1_ASP'] = (agg['d1w'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
                 agg['Disc%'] = (
                     (agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100
                 ).replace([np.inf, -np.inf], np.nan).fillna(0)
-
                 pivot = agg.pivot(index=group_col, columns='date', values='Disc%')
                 pivot.columns = [str(c) for c in pivot.columns]
                 pivot.columns.name = None
-                pivot = pivot.reset_index().rename(columns={group_col: display_name})
-                return pivot, display_name
+                return pivot.reset_index().rename(columns={group_col: label_col})
 
-            sc_pivot, sc_name = make_disc_pivot('super_category', 'Super Category')
-            v_pivot, v_name = make_disc_pivot('vertical', 'Vertical')
+            sc_pivot = make_disc_pivot('super_category', 'Super Category')
+            v_pivot  = make_disc_pivot('vertical', 'Vertical')
 
             if not sc_pivot.empty:
                 st.markdown("**Super Category**")
-                st.dataframe(style_date_disc(sc_pivot), use_container_width=True)
+                st.dataframe(style_date_disc(sc_pivot, 'Super Category'), use_container_width=True)
             else:
-                st.info("No super_category data available for this filter.")
+                st.info("No super_category data available.")
 
             st.divider()
 
             if not v_pivot.empty:
                 st.markdown("**Vertical**")
-                st.dataframe(style_date_disc(v_pivot), use_container_width=True)
+                st.dataframe(style_date_disc(v_pivot, 'Vertical'), use_container_width=True)
             else:
-                st.info("No vertical data available for this filter.")
+                st.info("No vertical data available.")
 
         st.caption(
             "Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100, weighted by JA units  ·  "
