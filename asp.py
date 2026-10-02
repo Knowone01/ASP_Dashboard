@@ -222,7 +222,7 @@ def style_date_disc(df, label_col):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs(
-    ['Basefile Data', 'Seller Level Pivot', 'Brand Level Pivot', 'Date-Level Disc%']
+    ['Basefile Data', 'Seller Level Pivot', 'Brand Level Pivot', 'Output ASP']
 )
 
 with tab1:
