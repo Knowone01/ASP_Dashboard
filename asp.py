@@ -197,7 +197,48 @@ brand_pivot['Fixed_d-1_ASP'] = (brand_pivot['Sum_d1_ASP_x_JA_units'] / brand_piv
 brand_pivot['Disc %'] = ((brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
-# ── Stylers ───────────────────────────────────────────────────────────────────
+# ── df_dated: shared by both ASP tabs ────────────────────────────────────────
+df_dated = pd.DataFrame()
+
+if valid_lids:
+    _ja_ref = (
+        basefile[basefile['listing_id'].isin(valid_lids)]
+        [['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue']]
+        .drop_duplicates('listing_id')
+    )
+
+    df_dated = (
+        df_d1[
+            df_d1['listing_id'].isin(valid_lids) &
+            (df_d1['date'] >= start_date) &
+            (df_d1['date'] <= end_date)
+        ]
+        .merge(_ja_ref, on='listing_id', how='inner')
+        .merge(
+            lid_attrs[['listing_id', 'super_category', 'vertical']].assign(
+                super_category=lid_attrs['super_category'].astype(str),
+                vertical=lid_attrs['vertical'].astype(str),
+            ),
+            on='listing_id', how='left'
+        )
+    )
+
+    if not df_dated.empty:
+        df_dated['d-1_ASP'] = (
+            (df_dated['d-1_revenue'] / df_dated['d-1_units'])
+            .replace([np.inf, -np.inf], np.nan).fillna(0)
+        )
+
+        # Input ASP weights  — fixed by JA units
+        df_dated['jaw']     = df_dated['JA_ASP']     * df_dated['JA_units']
+        df_dated['d1w']     = df_dated['d-1_ASP']    * df_dated['JA_units']
+
+        # Output ASP weights — fixed by d-1 units
+        df_dated['jaw_out'] = df_dated['JA_ASP']     * df_dated['d-1_units']
+        df_dated['d1w_out'] = df_dated['d-1_revenue']   # = d-1_ASP × d-1_units
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
 def style_pivot(df):
     def color_disc(v):
         return ("background-color: #f8d7da; color: #842029" if v < 0
@@ -220,25 +261,45 @@ def style_date_disc(df, label_col):
     return fn(color, subset=date_cols)
 
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs(
-    ['Basefile Data', 'Seller Level Pivot', 'Brand Level Pivot', 'Output ASP']
-)
+def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gmv=False):
+    """
+    Generic disc% pivot.
+      jaw_col  : column holding  JA_ASP  × weight
+      d1w_col  : column holding  d-1_ASP × weight  (or d-1_revenue directly)
+      unit_col : column holding  the fixing weight (JA_units or d-1_units)
+    """
+    sub = df_dated.dropna(subset=[group_col])
+    sub = sub[sub[group_col] != 'nan']
+    if sub.empty:
+        return pd.DataFrame()
 
-with tab1:
-    st.subheader('Basefile (Filtered by Date)')
-    st.dataframe(basefile_display.round(2), use_container_width=True)
+    agg = (sub.groupby([group_col, 'date'])
+              .agg(jaw=(jaw_col, 'sum'), d1w=(d1w_col, 'sum'), ju=(unit_col, 'sum'))
+              .reset_index())
+    agg['Fixed_JA_ASP'] = (agg['jaw'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
+    agg['Fixed_d1_ASP'] = (agg['d1w'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
+    agg['Disc%'] = (
+        (agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100
+    ).replace([np.inf, -np.inf], np.nan).fillna(0)
 
-with tab2:
-    st.subheader('ASP Fixed by JA Units - Seller Level')
-    st.dataframe(style_pivot(seller_pivot), use_container_width=True)
+    pivot = agg.pivot(index=group_col, columns='date', values='Disc%')
+    pivot.columns = [str(c) for c in pivot.columns]
+    pivot.columns.name = None
+    pivot = pivot.reset_index().rename(columns={group_col: label_col})
 
-with tab3:
-    st.subheader('ASP Fixed by JA Units - Brand Level')
-    st.dataframe(style_pivot(brand_pivot), use_container_width=True)
+    if sort_by_gmv:
+        gmv_order = (sub.groupby(group_col)['JA_revenue']
+                        .sum()
+                        .reset_index()
+                        .rename(columns={group_col: label_col})
+                        .sort_values('JA_revenue', ascending=False))
+        pivot = gmv_order[[label_col]].merge(pivot, on=label_col, how='left')
 
-with tab4:
-    st.subheader('Date-Level Disc% — Non-Alpha + Unbranded Common LIDs')
+    return pivot
+
+
+def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix):
+    st.subheader(title)
 
     if not valid_lids:
         st.warning(
@@ -249,84 +310,66 @@ with tab4:
         with st.expander("Debug"):
             st.write("alpha_flag values:", lid_attrs['alpha_flag'].unique().tolist())
             st.write("Brand_Tag values:",  lid_attrs['Brand_Tag'].unique().tolist())
+        return
+
+    if df_dated.empty:
+        st.info('No d-1 data for the selected date range after applying filters.')
+        return
+
+    sc_pivot = make_disc_pivot('super_category', 'Super Category', jaw_col, d1w_col, unit_col)
+    v_pivot  = make_disc_pivot('vertical',       'Vertical',       jaw_col, d1w_col, unit_col, sort_by_gmv=True)
+
+    if not sc_pivot.empty:
+        st.markdown('**Super Category**')
+        st.dataframe(style_date_disc(sc_pivot, 'Super Category'), use_container_width=True)
     else:
-        _ja_ref = (
-            basefile[basefile['listing_id'].isin(valid_lids)]
-            [['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue']]
-            .drop_duplicates('listing_id')
-        )
+        st.info('No super_category data available.')
 
-        df_dated = (
-            df_d1[
-                df_d1['listing_id'].isin(valid_lids) &
-                (df_d1['date'] >= start_date) &
-                (df_d1['date'] <= end_date)
-            ]
-            .merge(_ja_ref, on='listing_id', how='inner')
-            .merge(
-                lid_attrs[['listing_id', 'super_category', 'vertical']].assign(
-                    super_category=lid_attrs['super_category'].astype(str),
-                    vertical=lid_attrs['vertical'].astype(str),
-                ),
-                on='listing_id', how='left'
-            )
-        )
+    st.divider()
 
-        if df_dated.empty:
-            st.info('No d-1 data for the selected date range after applying filters.')
-        else:
-            df_dated['d-1_ASP'] = (
-                (df_dated['d-1_revenue'] / df_dated['d-1_units'])
-                .replace([np.inf, -np.inf], np.nan).fillna(0)
-            )
-            df_dated['d1w'] = df_dated['d-1_ASP'] * df_dated['JA_units']
-            df_dated['jaw'] = df_dated['JA_ASP']   * df_dated['JA_units']
+    if not v_pivot.empty:
+        st.markdown('**Vertical**')
+        st.dataframe(style_date_disc(v_pivot, 'Vertical'), use_container_width=True)
+    else:
+        st.info('No vertical data available.')
 
-            def make_disc_pivot(group_col, label_col, sort_by_gmv=False):
-                sub = df_dated.dropna(subset=[group_col])
-                sub = sub[sub[group_col] != 'nan']
-                if sub.empty:
-                    return pd.DataFrame()
-                agg = (sub.groupby([group_col, 'date'])
-                          .agg(jaw=('jaw', 'sum'), d1w=('d1w', 'sum'), ju=('JA_units', 'sum'))
-                          .reset_index())
-                agg['Fixed_JA_ASP'] = (agg['jaw'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
-                agg['Fixed_d1_ASP'] = (agg['d1w'] / agg['ju']).replace([np.inf, -np.inf], np.nan).fillna(0)
-                agg['Disc%'] = ((agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
-                pivot = agg.pivot(index=group_col, columns='date', values='Disc%')
-                pivot.columns = [str(c) for c in pivot.columns]
-                pivot.columns.name = None
-                pivot = pivot.reset_index().rename(columns={group_col: label_col})
+    st.caption(
+        f'Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100  ·  {caption_suffix}  ·  '
+        'Common LIDs · Non-Alpha · Unbranded only  ·  Verticals sorted by JA GMV descending'
+    )
 
-                if sort_by_gmv:
-                    gmv_order = (sub.groupby(group_col)['JA_revenue']
-                                    .sum()
-                                    .reset_index()
-                                    .rename(columns={group_col: label_col})
-                                    .sort_values('JA_revenue', ascending=False))
-                    pivot = gmv_order[[label_col]].merge(pivot, on=label_col, how='left')
 
-                return pivot
+# ── Tabs ──────────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    'Output ASP', 'Input ASP', 'Seller Level Pivot', 'Brand Level Pivot', 'Basefile Data'
+])
 
-            sc_pivot = make_disc_pivot('super_category', 'Super Category')
-            v_pivot  = make_disc_pivot('vertical', 'Vertical', sort_by_gmv=True)
+with tab1:
+    render_asp_tab(
+        title          = 'Output ASP — Fixed by d-1 Units',
+        jaw_col        = 'jaw_out',
+        d1w_col        = 'd1w_out',
+        unit_col       = 'd-1_units',
+        caption_suffix = 'weighted by d-1 units',
+    )
 
-            if not sc_pivot.empty:
-                st.markdown('**Super Category**')
-                st.dataframe(style_date_disc(sc_pivot, 'Super Category'), use_container_width=True)
-            else:
-                st.info('No super_category data available.')
+with tab2:
+    render_asp_tab(
+        title          = 'Input ASP — Fixed by JA Units',
+        jaw_col        = 'jaw',
+        d1w_col        = 'd1w',
+        unit_col       = 'JA_units',
+        caption_suffix = 'weighted by JA units',
+    )
 
-            st.divider()
+with tab3:
+    st.subheader('ASP Fixed by JA Units - Seller Level')
+    st.dataframe(style_pivot(seller_pivot), use_container_width=True)
 
-            if not v_pivot.empty:
-                st.markdown('**Vertical**')
-                st.dataframe(style_date_disc(v_pivot, 'Vertical'), use_container_width=True)
-            else:
-                st.info('No vertical data available.')
+with tab4:
+    st.subheader('ASP Fixed by JA Units - Brand Level')
+    st.dataframe(style_pivot(brand_pivot), use_container_width=True)
 
-        st.caption(
-            'Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100, weighted by JA units  ·  '
-            'Common LIDs · Non-Alpha · Unbranded only  ·  '
-            'Verticals sorted by JA GMV descending'
-        )
+with tab5:
+    st.subheader('Basefile (Filtered by Date)')
+    st.dataframe(basefile_display.round(2), use_container_width=True)
