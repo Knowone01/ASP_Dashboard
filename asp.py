@@ -1,3 +1,8 @@
+
+Pulkit Bhardwaj
+11:11 (0 minutes ago)
+to me
+
 import gc
 import streamlit as st
 import pandas as pd
@@ -18,7 +23,7 @@ def normalize(columns):
 @st.cache_resource
 def load_data():
     id_cols    = ['listing_id', 'seller_id', 'seller_name', 'brand']
-    extra_cols = ['super_category', 'vertical', 'alpha_flag']
+    extra_cols = ['super_category', 'vertical', 'alpha_flag', 'asp_bucket']
 
     # ── JA ────────────────────────────────────────────────────────────────────
     df_ja = pd.read_csv(
@@ -197,7 +202,7 @@ brand_pivot['Fixed_d-1_ASP'] = (brand_pivot['Sum_d1_ASP_x_JA_units'] / brand_piv
 brand_pivot['Disc %'] = ((brand_pivot['Fixed_d-1_ASP'] / brand_pivot['Fixed_JA_ASP'] - 1) * 100).replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
-# ── df_dated: shared by both ASP tabs ────────────────────────────────────────
+# ── df_dated: shared by all ASP tabs ─────────────────────────────────────────
 df_dated = pd.DataFrame()
 
 if valid_lids:
@@ -207,20 +212,23 @@ if valid_lids:
         .drop_duplicates('listing_id')
     )
 
+    _attr_cols = (
+        lid_attrs[['listing_id', 'super_category', 'vertical', 'asp_bucket']]
+        .assign(
+            super_category=lid_attrs['super_category'].astype(str),
+            vertical      =lid_attrs['vertical'].astype(str),
+            asp_bucket    =lid_attrs['asp_bucket'].astype(str),
+        )
+    )
+
     df_dated = (
         df_d1[
             df_d1['listing_id'].isin(valid_lids) &
             (df_d1['date'] >= start_date) &
             (df_d1['date'] <= end_date)
         ]
-        .merge(_ja_ref, on='listing_id', how='inner')
-        .merge(
-            lid_attrs[['listing_id', 'super_category', 'vertical']].assign(
-                super_category=lid_attrs['super_category'].astype(str),
-                vertical=lid_attrs['vertical'].astype(str),
-            ),
-            on='listing_id', how='left'
-        )
+        .merge(_ja_ref,    on='listing_id', how='inner')
+        .merge(_attr_cols, on='listing_id', how='left')
     )
 
     if not df_dated.empty:
@@ -228,13 +236,11 @@ if valid_lids:
             (df_dated['d-1_revenue'] / df_dated['d-1_units'])
             .replace([np.inf, -np.inf], np.nan).fillna(0)
         )
-
         # Input ASP weights  — fixed by JA units
-        df_dated['jaw']     = df_dated['JA_ASP']     * df_dated['JA_units']
-        df_dated['d1w']     = df_dated['d-1_ASP']    * df_dated['JA_units']
-
+        df_dated['jaw']     = df_dated['JA_ASP']  * df_dated['JA_units']
+        df_dated['d1w']     = df_dated['d-1_ASP'] * df_dated['JA_units']
         # Output ASP weights — fixed by d-1 units
-        df_dated['jaw_out'] = df_dated['JA_ASP']     * df_dated['d-1_units']
+        df_dated['jaw_out'] = df_dated['JA_ASP']  * df_dated['d-1_units']
         df_dated['d1w_out'] = df_dated['d-1_revenue']   # = d-1_ASP × d-1_units
 
 
@@ -262,12 +268,6 @@ def style_date_disc(df, label_col):
 
 
 def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gmv=False):
-    """
-    Generic disc% pivot.
-      jaw_col  : column holding  JA_ASP  × weight
-      d1w_col  : column holding  d-1_ASP × weight  (or d-1_revenue directly)
-      unit_col : column holding  the fixing weight (JA_units or d-1_units)
-    """
     sub = df_dated.dropna(subset=[group_col])
     sub = sub[sub[group_col] != 'nan']
     if sub.empty:
@@ -298,7 +298,10 @@ def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gm
     return pivot
 
 
-def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix):
+def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix, sections):
+    """
+    sections: list of (group_col, label_col, sort_by_gmv)
+    """
     st.subheader(title)
 
     if not valid_lids:
@@ -316,22 +319,15 @@ def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix):
         st.info('No d-1 data for the selected date range after applying filters.')
         return
 
-    sc_pivot = make_disc_pivot('super_category', 'Super Category', jaw_col, d1w_col, unit_col)
-    v_pivot  = make_disc_pivot('vertical',       'Vertical',       jaw_col, d1w_col, unit_col, sort_by_gmv=True)
-
-    if not sc_pivot.empty:
-        st.markdown('**Super Category**')
-        st.dataframe(style_date_disc(sc_pivot, 'Super Category'), use_container_width=True)
-    else:
-        st.info('No super_category data available.')
-
-    st.divider()
-
-    if not v_pivot.empty:
-        st.markdown('**Vertical**')
-        st.dataframe(style_date_disc(v_pivot, 'Vertical'), use_container_width=True)
-    else:
-        st.info('No vertical data available.')
+    for i, (group_col, label_col, sort_by_gmv) in enumerate(sections):
+        pivot = make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gmv)
+        if not pivot.empty:
+            st.markdown(f'**{label_col}**')
+            st.dataframe(style_date_disc(pivot, label_col), use_container_width=True)
+        else:
+            st.info(f'No {label_col} data available.')
+        if i < len(sections) - 1:
+            st.divider()
 
     st.caption(
         f'Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100  ·  {caption_suffix}  ·  '
@@ -339,9 +335,26 @@ def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix):
     )
 
 
+# ── Sections definitions ──────────────────────────────────────────────────────
+# (group_col, label_col, sort_by_gmv)
+SC_V_SECTIONS  = [
+    ('super_category', 'Super Category', False),
+    ('vertical',       'Vertical',       True),
+]
+BUCKET_SECTIONS = [
+    ('asp_bucket', 'ASP Bucket', True),
+]
+
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    'Output ASP', 'Input ASP', 'Seller Level Pivot', 'Brand Level Pivot', 'Basefile Data'
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    'Output ASP',
+    'Input ASP',
+    'Output ASP (ASP Bucket)',
+    'Input ASP (ASP Bucket)',
+    'Seller Level Pivot',
+    'Brand Level Pivot',
+    'Basefile Data',
 ])
 
 with tab1:
@@ -351,6 +364,7 @@ with tab1:
         d1w_col        = 'd1w_out',
         unit_col       = 'd-1_units',
         caption_suffix = 'weighted by d-1 units',
+        sections       = SC_V_SECTIONS,
     )
 
 with tab2:
@@ -360,16 +374,37 @@ with tab2:
         d1w_col        = 'd1w',
         unit_col       = 'JA_units',
         caption_suffix = 'weighted by JA units',
+        sections       = SC_V_SECTIONS,
     )
 
 with tab3:
+    render_asp_tab(
+        title          = 'Output ASP — ASP Bucket (Fixed by d-1 Units)',
+        jaw_col        = 'jaw_out',
+        d1w_col        = 'd1w_out',
+        unit_col       = 'd-1_units',
+        caption_suffix = 'weighted by d-1 units',
+        sections       = BUCKET_SECTIONS,
+    )
+
+with tab4:
+    render_asp_tab(
+        title          = 'Input ASP — ASP Bucket (Fixed by JA Units)',
+        jaw_col        = 'jaw',
+        d1w_col        = 'd1w',
+        unit_col       = 'JA_units',
+        caption_suffix = 'weighted by JA units',
+        sections       = BUCKET_SECTIONS,
+    )
+
+with tab5:
     st.subheader('ASP Fixed by JA Units - Seller Level')
     st.dataframe(style_pivot(seller_pivot), use_container_width=True)
 
-with tab4:
+with tab6:
     st.subheader('ASP Fixed by JA Units - Brand Level')
     st.dataframe(style_pivot(brand_pivot), use_container_width=True)
 
-with tab5:
+with tab7:
     st.subheader('Basefile (Filtered by Date)')
     st.dataframe(basefile_display.round(2), use_container_width=True)
