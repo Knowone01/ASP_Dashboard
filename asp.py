@@ -1,6 +1,3 @@
-
-
-
 import gc
 import streamlit as st
 import pandas as pd
@@ -16,6 +13,20 @@ def to_num(s):
 
 def normalize(columns):
     return columns.str.strip().str.lower().str.replace(' ', '_', regex=False)
+
+
+BUCKET_BINS   = [0, 200, 300, 500, 1000, np.inf]
+BUCKET_LABELS = ['0-200', '200-300', '300-500', '500-1000', 'Above 1000']
+
+
+def assign_bucket(asp_series):
+    return pd.cut(
+        asp_series,
+        bins=BUCKET_BINS,
+        labels=BUCKET_LABELS,
+        right=True,
+        include_lowest=True,
+    ).astype(str)
 
 
 @st.cache_resource
@@ -146,6 +157,9 @@ basefile['d-1_ASP'] = (
 basefile['JA_ASP*JA_units']  = basefile['JA_ASP']  * basefile['JA_units']
 basefile['d-1_ASP*JA_units'] = basefile['d-1_ASP'] * basefile['JA_units']
 
+# JA ASP bucket: derived from JA_ASP, fixed per LID
+basefile['JA_asp_bucket'] = assign_bucket(basefile['JA_ASP'])
+
 basefile_display = basefile[[
     'listing_id', 'seller_id', 'seller_name', 'brand',
     'JA_revenue', 'JA_units', 'd-1_revenue', 'd-1_units',
@@ -153,7 +167,7 @@ basefile_display = basefile[[
 ]]
 
 
-# ── LID attrs ────────────────────────────────────────────────────────────────
+# ── LID attrs ─────────────────────────────────────────────────────────────────
 common_lids = set(basefile['listing_id'])
 
 lid_attrs = (
@@ -163,6 +177,10 @@ lid_attrs = (
 )
 lid_attrs['Brand_Tag']  = lid_attrs['brand'].astype(str).map(_lookup_map).fillna('Unbranded')
 lid_attrs['alpha_flag'] = lid_attrs['alpha_flag'].astype(str).str.strip()
+
+# Add JA_asp_bucket from basefile (computed from JA_ASP)
+_ja_bucket_map        = basefile.set_index('listing_id')['JA_asp_bucket']
+lid_attrs['JA_asp_bucket'] = lid_attrs['listing_id'].map(_ja_bucket_map).fillna('Unknown')
 
 valid_lids = set(
     lid_attrs[
@@ -210,14 +228,12 @@ if valid_lids:
         .drop_duplicates('listing_id')
     )
 
-    _attr_cols = (
-        lid_attrs[['listing_id', 'super_category', 'vertical', 'asp_bucket']]
-        .assign(
-            super_category=lid_attrs['super_category'].astype(str),
-            vertical      =lid_attrs['vertical'].astype(str),
-            asp_bucket    =lid_attrs['asp_bucket'].astype(str),
-        )
-    )
+    _attr_cols = lid_attrs[
+        lid_attrs['listing_id'].isin(valid_lids)
+    ][['listing_id', 'super_category', 'vertical', 'asp_bucket', 'JA_asp_bucket']].copy()
+
+    for col in ['super_category', 'vertical', 'asp_bucket', 'JA_asp_bucket']:
+        _attr_cols[col] = _attr_cols[col].astype(str)
 
     df_dated = (
         df_d1[
@@ -265,9 +281,14 @@ def style_date_disc(df, label_col):
     return fn(color, subset=date_cols)
 
 
-def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gmv=False):
+def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col,
+                    sort_by_gmv=False, sort_order=None):
+    """
+    sort_order : list of label values in desired display order (e.g. bucket order)
+    sort_by_gmv: sort descending by JA GMV (used for vertical)
+    """
     sub = df_dated.dropna(subset=[group_col])
-    sub = sub[sub[group_col] != 'nan']
+    sub = sub[sub[group_col].astype(str) != 'nan']
     if sub.empty:
         return pd.DataFrame()
 
@@ -285,7 +306,11 @@ def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gm
     pivot.columns.name = None
     pivot = pivot.reset_index().rename(columns={group_col: label_col})
 
-    if sort_by_gmv:
+    if sort_order is not None:
+        # Keep only rows that exist in data, in the defined order
+        order_df = pd.DataFrame({label_col: [b for b in sort_order if b in pivot[label_col].values]})
+        pivot = order_df.merge(pivot, on=label_col, how='left')
+    elif sort_by_gmv:
         gmv_order = (sub.groupby(group_col)['JA_revenue']
                         .sum()
                         .reset_index()
@@ -298,7 +323,7 @@ def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gm
 
 def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix, sections):
     """
-    sections: list of (group_col, label_col, sort_by_gmv)
+    sections: list of (group_col, label_col, sort_by_gmv, sort_order)
     """
     st.subheader(title)
 
@@ -317,8 +342,10 @@ def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix, sections):
         st.info('No d-1 data for the selected date range after applying filters.')
         return
 
-    for i, (group_col, label_col, sort_by_gmv) in enumerate(sections):
-        pivot = make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gmv)
+    for i, (group_col, label_col, sort_by_gmv, sort_order) in enumerate(sections):
+        pivot = make_disc_pivot(
+            group_col, label_col, jaw_col, d1w_col, unit_col, sort_by_gmv, sort_order
+        )
         if not pivot.empty:
             st.markdown(f'**{label_col}**')
             st.dataframe(style_date_disc(pivot, label_col), use_container_width=True)
@@ -329,18 +356,25 @@ def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix, sections):
 
     st.caption(
         f'Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100  ·  {caption_suffix}  ·  '
-        'Common LIDs · Non-Alpha · Unbranded only  ·  Verticals sorted by JA GMV descending'
+        'Common LIDs · Non-Alpha · Unbranded only'
     )
 
 
-# ── Sections definitions ──────────────────────────────────────────────────────
-# (group_col, label_col, sort_by_gmv)
-SC_V_SECTIONS  = [
-    ('super_category', 'Super Category', False),
-    ('vertical',       'Vertical',       True),
+# ── Section definitions ───────────────────────────────────────────────────────
+# (group_col, label_col, sort_by_gmv, sort_order)
+SC_V_SECTIONS = [
+    ('super_category', 'Super Category', False, None),
+    ('vertical',       'Vertical',       True,  None),
 ]
-BUCKET_SECTIONS = [
-    ('asp_bucket', 'ASP Bucket', True),
+
+# Input ASP bucket: JA_asp_bucket (computed from JA_ASP, fixed per LID)
+INPUT_BUCKET_SECTIONS = [
+    ('JA_asp_bucket', 'JA ASP Bucket', False, BUCKET_LABELS),
+]
+
+# Output ASP bucket: asp_bucket from d-1 sheet (can change by date)
+OUTPUT_BUCKET_SECTIONS = [
+    ('asp_bucket', 'D-1 ASP Bucket', False, BUCKET_LABELS),
 ]
 
 
@@ -361,7 +395,7 @@ with tab1:
         jaw_col        = 'jaw_out',
         d1w_col        = 'd1w_out',
         unit_col       = 'd-1_units',
-        caption_suffix = 'weighted by d-1 units',
+        caption_suffix = 'weighted by d-1 units · verticals sorted by JA GMV',
         sections       = SC_V_SECTIONS,
     )
 
@@ -371,28 +405,28 @@ with tab2:
         jaw_col        = 'jaw',
         d1w_col        = 'd1w',
         unit_col       = 'JA_units',
-        caption_suffix = 'weighted by JA units',
+        caption_suffix = 'weighted by JA units · verticals sorted by JA GMV',
         sections       = SC_V_SECTIONS,
     )
 
 with tab3:
     render_asp_tab(
-        title          = 'Output ASP — ASP Bucket (Fixed by d-1 Units)',
+        title          = 'Output ASP — D-1 ASP Bucket (Fixed by d-1 Units)',
         jaw_col        = 'jaw_out',
         d1w_col        = 'd1w_out',
         unit_col       = 'd-1_units',
-        caption_suffix = 'weighted by d-1 units',
-        sections       = BUCKET_SECTIONS,
+        caption_suffix = 'weighted by d-1 units · d-1 ASP bucket from d-1 sheet',
+        sections       = OUTPUT_BUCKET_SECTIONS,
     )
 
 with tab4:
     render_asp_tab(
-        title          = 'Input ASP — ASP Bucket (Fixed by JA Units)',
+        title          = 'Input ASP — JA ASP Bucket (Fixed by JA Units)',
         jaw_col        = 'jaw',
         d1w_col        = 'd1w',
         unit_col       = 'JA_units',
-        caption_suffix = 'weighted by JA units',
-        sections       = BUCKET_SECTIONS,
+        caption_suffix = 'weighted by JA units · JA ASP bucket derived from JA_ASP',
+        sections       = INPUT_BUCKET_SECTIONS,
     )
 
 with tab5:
