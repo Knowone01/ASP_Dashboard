@@ -178,8 +178,7 @@ lid_attrs = (
 lid_attrs['Brand_Tag']  = lid_attrs['brand'].astype(str).map(_lookup_map).fillna('Unbranded')
 lid_attrs['alpha_flag'] = lid_attrs['alpha_flag'].astype(str).str.strip()
 
-# Add JA_asp_bucket from basefile (computed from JA_ASP)
-_ja_bucket_map        = basefile.set_index('listing_id')['JA_asp_bucket']
+_ja_bucket_map         = basefile.set_index('listing_id')['JA_asp_bucket']
 lid_attrs['JA_asp_bucket'] = lid_attrs['listing_id'].map(_ja_bucket_map).fillna('Unknown')
 
 valid_lids = set(
@@ -250,30 +249,35 @@ if valid_lids:
             (df_dated['d-1_revenue'] / df_dated['d-1_units'])
             .replace([np.inf, -np.inf], np.nan).fillna(0)
         )
-        # Input ASP weights  — fixed by JA units
         df_dated['jaw']     = df_dated['JA_ASP']  * df_dated['JA_units']
         df_dated['d1w']     = df_dated['d-1_ASP'] * df_dated['JA_units']
-        # Output ASP weights — fixed by d-1 units
         df_dated['jaw_out'] = df_dated['JA_ASP']  * df_dated['d-1_units']
-        df_dated['d1w_out'] = df_dated['d-1_revenue']   # = d-1_ASP × d-1_units
+        df_dated['d1w_out'] = df_dated['d-1_revenue']
 
 
-# ── Shared helpers ────────────────────────────────────────────────────────────
-def style_pivot(df):
+# ── Stylers ───────────────────────────────────────────────────────────────────
+# Negative = green (price dropped = good), Positive = red (price rose = bad)
+GREEN = "background-color: #d1e7dd; color: #0f5132"
+RED   = "background-color: #f8d7da; color: #842029"
+
+
+def style_pivot(df, index_col):
+    """Freeze index_col as index; green if Disc% negative, red otherwise."""
+    df = df.set_index(index_col)
     def color_disc(v):
-        return ("background-color: #f8d7da; color: #842029" if v < 0
-                else "background-color: #d1e7dd; color: #0f5132")
+        return GREEN if v < 0 else RED
     styler = df.style.format(precision=2)
     fn = styler.map if hasattr(styler, 'map') else styler.applymap
     return fn(color_disc, subset=['Disc %'])
 
 
 def style_date_disc(df, label_col):
-    date_cols = [c for c in df.columns if c != label_col]
+    """Freeze label_col as index; green if negative, red otherwise."""
+    df = df.set_index(label_col)
+    date_cols = df.columns.tolist()
     def color(v):
         try:
-            return ("background-color: #f8d7da; color: #842029" if float(v) < 0
-                    else "background-color: #d1e7dd; color: #0f5132")
+            return GREEN if float(v) < 0 else RED
         except (TypeError, ValueError):
             return ""
     s  = df.style.format({c: '{:.2f}' for c in date_cols})
@@ -281,12 +285,9 @@ def style_date_disc(df, label_col):
     return fn(color, subset=date_cols)
 
 
+# ── Pivot helpers ─────────────────────────────────────────────────────────────
 def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col,
                     sort_by_gmv=False, sort_order=None):
-    """
-    sort_order : list of label values in desired display order (e.g. bucket order)
-    sort_by_gmv: sort descending by JA GMV (used for vertical)
-    """
     sub = df_dated.dropna(subset=[group_col])
     sub = sub[sub[group_col].astype(str) != 'nan']
     if sub.empty:
@@ -307,7 +308,6 @@ def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col,
     pivot = pivot.reset_index().rename(columns={group_col: label_col})
 
     if sort_order is not None:
-        # Keep only rows that exist in data, in the defined order
         order_df = pd.DataFrame({label_col: [b for b in sort_order if b in pivot[label_col].values]})
         pivot = order_df.merge(pivot, on=label_col, how='left')
     elif sort_by_gmv:
@@ -322,9 +322,6 @@ def make_disc_pivot(group_col, label_col, jaw_col, d1w_col, unit_col,
 
 
 def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix, sections):
-    """
-    sections: list of (group_col, label_col, sort_by_gmv, sort_order)
-    """
     st.subheader(title)
 
     if not valid_lids:
@@ -361,21 +358,12 @@ def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix, sections):
 
 
 # ── Section definitions ───────────────────────────────────────────────────────
-# (group_col, label_col, sort_by_gmv, sort_order)
 SC_V_SECTIONS = [
     ('super_category', 'Super Category', False, None),
     ('vertical',       'Vertical',       True,  None),
 ]
-
-# Input ASP bucket: JA_asp_bucket (computed from JA_ASP, fixed per LID)
-INPUT_BUCKET_SECTIONS = [
-    ('JA_asp_bucket', 'JA ASP Bucket', False, BUCKET_LABELS),
-]
-
-# Output ASP bucket: asp_bucket from d-1 sheet (can change by date)
-OUTPUT_BUCKET_SECTIONS = [
-    ('asp_bucket', 'D-1 ASP Bucket', False, BUCKET_LABELS),
-]
+INPUT_BUCKET_SECTIONS  = [('JA_asp_bucket', 'JA ASP Bucket',  False, BUCKET_LABELS)]
+OUTPUT_BUCKET_SECTIONS = [('asp_bucket',    'D-1 ASP Bucket', False, BUCKET_LABELS)]
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -391,52 +379,47 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
 
 with tab1:
     render_asp_tab(
-        title          = 'Output ASP — Fixed by d-1 Units',
-        jaw_col        = 'jaw_out',
-        d1w_col        = 'd1w_out',
-        unit_col       = 'd-1_units',
-        caption_suffix = 'weighted by d-1 units · verticals sorted by JA GMV',
-        sections       = SC_V_SECTIONS,
+        title='Output ASP — Fixed by d-1 Units',
+        jaw_col='jaw_out', d1w_col='d1w_out', unit_col='d-1_units',
+        caption_suffix='weighted by d-1 units · verticals sorted by JA GMV',
+        sections=SC_V_SECTIONS,
     )
 
 with tab2:
     render_asp_tab(
-        title          = 'Input ASP — Fixed by JA Units',
-        jaw_col        = 'jaw',
-        d1w_col        = 'd1w',
-        unit_col       = 'JA_units',
-        caption_suffix = 'weighted by JA units · verticals sorted by JA GMV',
-        sections       = SC_V_SECTIONS,
+        title='Input ASP — Fixed by JA Units',
+        jaw_col='jaw', d1w_col='d1w', unit_col='JA_units',
+        caption_suffix='weighted by JA units · verticals sorted by JA GMV',
+        sections=SC_V_SECTIONS,
     )
 
 with tab3:
     render_asp_tab(
-        title          = 'Output ASP — D-1 ASP Bucket (Fixed by d-1 Units)',
-        jaw_col        = 'jaw_out',
-        d1w_col        = 'd1w_out',
-        unit_col       = 'd-1_units',
-        caption_suffix = 'weighted by d-1 units · d-1 ASP bucket from d-1 sheet',
-        sections       = OUTPUT_BUCKET_SECTIONS,
+        title='Output ASP — D-1 ASP Bucket (Fixed by d-1 Units)',
+        jaw_col='jaw_out', d1w_col='d1w_out', unit_col='d-1_units',
+        caption_suffix='weighted by d-1 units · d-1 ASP bucket from d-1 sheet',
+        sections=OUTPUT_BUCKET_SECTIONS,
     )
 
 with tab4:
     render_asp_tab(
-        title          = 'Input ASP — JA ASP Bucket (Fixed by JA Units)',
-        jaw_col        = 'jaw',
-        d1w_col        = 'd1w',
-        unit_col       = 'JA_units',
-        caption_suffix = 'weighted by JA units · JA ASP bucket derived from JA_ASP',
-        sections       = INPUT_BUCKET_SECTIONS,
+        title='Input ASP — JA ASP Bucket (Fixed by JA Units)',
+        jaw_col='jaw', d1w_col='d1w', unit_col='JA_units',
+        caption_suffix='weighted by JA units · JA ASP bucket derived from JA_ASP',
+        sections=INPUT_BUCKET_SECTIONS,
     )
 
 with tab5:
     st.subheader('ASP Fixed by JA Units - Seller Level')
-    st.dataframe(style_pivot(seller_pivot), use_container_width=True)
+    st.dataframe(style_pivot(seller_pivot, 'seller_id'), use_container_width=True)
 
 with tab6:
     st.subheader('ASP Fixed by JA Units - Brand Level')
-    st.dataframe(style_pivot(brand_pivot), use_container_width=True)
+    st.dataframe(style_pivot(brand_pivot, 'brand'), use_container_width=True)
 
 with tab7:
     st.subheader('Basefile (Filtered by Date)')
-    st.dataframe(basefile_display.round(2), use_container_width=True)
+    st.dataframe(
+        basefile_display.round(2).set_index('listing_id'),
+        use_container_width=True,
+    )
