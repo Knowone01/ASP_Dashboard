@@ -10,7 +10,7 @@ RED   = "background-color: #f8d7da; color: #842029"
 
 BUCKET_LABELS    = ['0-200', '200-300', '300-500', '500-1000', 'Above 1000']
 SEGMENT_OPTIONS  = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
-TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
+TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWestern Growth']
 
 NUM_COLS = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
 
@@ -117,6 +117,24 @@ def make_pivot(data, group_col, label_col, num_col, den_col,
                         .rename(columns={group_col: label_col})
                         .sort_values('gmv', ascending=False))
         pivot = gmv_order[[label_col]].merge(pivot, on=label_col, how='left')
+
+    # Overall row: sum num and den across all rows per date, then divide
+    date_cols = [c for c in pivot.columns if c != label_col]
+    overall_agg = (sub.groupby('date_', as_index=False)
+                      .agg(num=(num_col, 'sum'), den=(den_col, 'sum')))
+    overall_agg['disc'] = (
+        overall_agg['num'] / overall_agg['den'].replace(0, np.nan)
+    ).fillna(0) * 100
+
+    overall_row = {label_col: 'Overall'}
+    for _, r in overall_agg.iterrows():
+        if r['date_'] in date_cols:
+            overall_row[r['date_']] = r['disc']
+
+    pivot = pd.concat(
+        [pd.DataFrame([overall_row]), pivot],
+        ignore_index=True
+    )
 
     return pivot
 
