@@ -41,21 +41,28 @@ def load_data():
         "lid_JA.csv", usecols=id_cols + ['units', 'gmv'], dtype=str, low_memory=False,
     )
     df_ja.columns = normalize(df_ja.columns)
+    df_ja['listing_id'] = df_ja['listing_id'].str.strip().str.lower()
     df_ja['units'] = to_num(df_ja['units']).astype('float32')
     df_ja['gmv']   = to_num(df_ja['gmv']).astype('float32')
     df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
 
-    # ── d-1: includes fsn ──────────────────────────────────────────────
+    # ── d-1 ───────────────────────────────────────────────────────────────────
     _peek    = pd.read_csv("lid_d-1.csv", nrows=0)
     _col_map = dict(zip(normalize(_peek.columns), _peek.columns))
 
-    needed      = id_cols + ['fsn'] + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
+    needed      = id_cols + ['product_id'] + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
     usecols_act = [_col_map[n] for n in needed if n in _col_map]
     rename_map  = {_col_map[n]: n for n in needed if n in _col_map}
 
     d1_parts, meta_parts = [], []
     for chunk in pd.read_csv("lid_d-1.csv", usecols=usecols_act, dtype=str, chunksize=100_000):
         chunk = chunk.rename(columns=rename_map)
+
+        # Normalize join keys first — strips whitespace and lowercases
+        for key_col in ['listing_id', 'product_id']:
+            if key_col in chunk.columns:
+                chunk[key_col] = chunk[key_col].str.strip().str.lower()
+
         chunk['units']  = to_num(chunk['units']).astype('float32')
         chunk['amount'] = to_num(chunk['amount']).astype('float32')
         chunk['date']   = chunk['unit_creation_timestamp'].str.split('T').str[0]
@@ -65,8 +72,7 @@ def load_data():
             chunk.groupby(['listing_id', 'date'], as_index=False)
                  .agg({'units': 'sum', 'amount': 'sum'})
         )
-        # meta: one row per listing_id — includes fsn
-        meta_cols = [c for c in id_cols + ['fsn'] + extra_cols if c in chunk.columns]
+        meta_cols = [c for c in id_cols + ['product_id'] + extra_cols if c in chunk.columns]
         meta_parts.append(chunk[meta_cols].drop_duplicates('listing_id'))
 
     df_d1 = pd.concat(d1_parts, ignore_index=True)
@@ -84,7 +90,7 @@ def load_data():
                   .reset_index(drop=True))
     del meta_parts; gc.collect()
 
-    str_cols = [c for c in id_cols + ['fsn'] + extra_cols if c in lid_meta.columns]
+    str_cols = [c for c in id_cols + ['product_id'] + extra_cols if c in lid_meta.columns]
     for col in str_cols:
         if lid_meta[col].dtype == object:
             lid_meta[col] = lid_meta[col].str.strip().astype('category')
@@ -102,7 +108,6 @@ def load_data():
 @st.cache_data
 def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, end_date):
 
-    # ── Segment assignment for all common LIDs ────────────────────────────────
     d1_range    = _df_d1[(_df_d1['date'] >= start_date) & (_df_d1['date'] <= end_date)]
     common_lids = set(_df_ja['listing_id']) & set(d1_range['listing_id'])
 
@@ -119,24 +124,25 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
     lid_attrs.loc[ _is_non &  _is_unb, 'segment'] = 'Unbranded Non-Alpha'
     lid_attrs.loc[ _is_non & ~_is_unb, 'segment'] = 'Branded Non-Alpha'
 
-    # lid → fsn map (from lid_meta)
-    lid_to_pid = (lid_attrs.set_index('listing_id')['fsn'].astype(str)
-                  if 'fsn' in lid_attrs.columns else pd.Series(dtype=str))
+    lid_to_pid = (
+        lid_attrs.set_index('listing_id')['product_id'].astype(str)
+        if 'product_id' in lid_attrs.columns else pd.Series(dtype=str)
+    )
 
-    unbranded_lids    = set(lid_attrs[lid_attrs['segment'] == 'Unbranded Non-Alpha']['listing_id'])
+    unbranded_lids     = set(lid_attrs[lid_attrs['segment'] == 'Unbranded Non-Alpha']['listing_id'])
     alpha_branded_lids = set(lid_attrs[lid_attrs['segment'].isin(['Alpha', 'Branded Non-Alpha'])]['listing_id'])
 
-    # ── Listing-level basefile (for seller/brand pivots + basefile tab) ───────
+    # ── Listing-level basefile (seller/brand pivots + basefile tab) ───────────
     d1_agg_all = (d1_range.groupby('listing_id', as_index=False)
                           .agg({'d-1_units': 'sum', 'd-1_revenue': 'sum'}))
     basefile = pd.merge(_df_ja, d1_agg_all, on='listing_id', how='inner')
     _seg_map = lid_attrs.set_index('listing_id')['segment']
-    basefile['segment'] = basefile['listing_id'].map(_seg_map)
-    basefile['JA_ASP'] = (
+    basefile['segment']  = basefile['listing_id'].map(_seg_map)
+    basefile['JA_ASP']   = (
         (basefile['JA_revenue'] / basefile['JA_units'])
         .replace([np.inf, -np.inf], np.nan).fillna(0)
     )
-    basefile['d-1_ASP'] = (
+    basefile['d-1_ASP']  = (
         (basefile['d-1_revenue'] / basefile['d-1_units'])
         .replace([np.inf, -np.inf], np.nan).fillna(0)
     )
@@ -145,17 +151,19 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
     basefile['JA_asp_bucket']    = assign_bucket(basefile['JA_ASP'])
 
     # ── UNBRANDED: listing_id join ────────────────────────────────────────────
-    # JA reference at listing_id level
-    ja_ref_unb = (basefile[basefile['listing_id'].isin(unbranded_lids)]
-                  [['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue', 'JA_asp_bucket']]
-                  .drop_duplicates('listing_id'))
+    ja_ref_unb = (
+        basefile[basefile['listing_id'].isin(unbranded_lids)]
+        [['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue', 'JA_asp_bucket']]
+        .drop_duplicates('listing_id')
+    )
 
-    attrs_unb = (lid_attrs[lid_attrs['segment'] == 'Unbranded Non-Alpha']
-                 [['listing_id', 'super_category', 'vertical', 'asp_bucket', 'segment']]
-                 .copy())
+    attrs_unb = (
+        lid_attrs[lid_attrs['segment'] == 'Unbranded Non-Alpha']
+        [['listing_id', 'super_category', 'vertical', 'asp_bucket', 'segment']]
+        .copy()
+    )
     for col in ['super_category', 'vertical', 'asp_bucket']:
         attrs_unb[col] = attrs_unb[col].astype(str)
-
     attrs_unb = attrs_unb.merge(
         ja_ref_unb[['listing_id', 'JA_asp_bucket']], on='listing_id', how='left'
     )
@@ -171,8 +179,7 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
         .merge(attrs_unb, on='listing_id', how='left')
     )
 
-    # ── ALPHA + BRANDED: fsn join ──────────────────────────────────────
-    # Add fsn to alpha/branded d-1 rows
+    # ── ALPHA + BRANDED: product_id join ──────────────────────────────────────
     d1_ab = (
         _df_d1[
             _df_d1['listing_id'].isin(alpha_branded_lids) &
@@ -180,46 +187,51 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
             (_df_d1['date'] <= end_date)
         ].copy()
     )
-    d1_ab['fsn'] = d1_ab['listing_id'].map(lid_to_pid)
-    d1_ab = d1_ab.dropna(subset=['fsn'])
+    d1_ab['product_id'] = d1_ab['listing_id'].map(lid_to_pid)
+    d1_ab = d1_ab.dropna(subset=['product_id'])
 
-    # Daily d-1 aggregated at fsn level
-    d1_daily_pid = (d1_ab.groupby(['fsn', 'date'], as_index=False)
+    d1_daily_pid = (d1_ab.groupby(['product_id', 'date'], as_index=False)
                          .agg({'d-1_units': 'sum', 'd-1_revenue': 'sum'}))
 
-    # JA aggregated at fsn level
-    ja_ab = (_df_ja[_df_ja['listing_id'].isin(alpha_branded_lids)].copy())
-    ja_ab['fsn'] = ja_ab['listing_id'].map(lid_to_pid)
-    ja_ab = ja_ab.dropna(subset=['fsn'])
-    ja_pid = (ja_ab.groupby('fsn', as_index=False)
+    ja_ab = _df_ja[_df_ja['listing_id'].isin(alpha_branded_lids)].copy()
+    ja_ab['product_id'] = ja_ab['listing_id'].map(lid_to_pid)
+    ja_ab = ja_ab.dropna(subset=['product_id'])
+
+    ja_pid = (ja_ab.groupby('product_id', as_index=False)
                    .agg({'JA_units': 'sum', 'JA_revenue': 'sum'}))
-    ja_pid['JA_ASP']        = (ja_pid['JA_revenue'] / ja_pid['JA_units']).replace([np.inf,-np.inf],np.nan).fillna(0)
+    ja_pid['JA_ASP']        = (
+        (ja_pid['JA_revenue'] / ja_pid['JA_units'])
+        .replace([np.inf, -np.inf], np.nan).fillna(0)
+    )
     ja_pid['JA_asp_bucket'] = assign_bucket(ja_pid['JA_ASP'])
 
-    # Attributes at fsn level (take first value per product)
-    attrs_pid = (lid_attrs[lid_attrs['segment'].isin(['Alpha', 'Branded Non-Alpha'])]
-                 [['fsn', 'super_category', 'vertical', 'segment']]
-                 .drop_duplicates('fsn')
-                 .copy())
+    attrs_pid = (
+        lid_attrs[lid_attrs['segment'].isin(['Alpha', 'Branded Non-Alpha'])]
+        [['product_id', 'super_category', 'vertical', 'segment']]
+        .drop_duplicates('product_id')
+        .copy()
+    )
     for col in ['super_category', 'vertical']:
         attrs_pid[col] = attrs_pid[col].astype(str)
     attrs_pid = attrs_pid.merge(
-        ja_pid[['fsn', 'JA_asp_bucket']], on='fsn', how='left'
+        ja_pid[['product_id', 'JA_asp_bucket']], on='product_id', how='left'
     )
     attrs_pid['JA_asp_bucket'] = attrs_pid['JA_asp_bucket'].astype(str)
 
     df_dated_pid = (
         d1_daily_pid
-        .merge(ja_pid[['fsn', 'JA_units', 'JA_ASP', 'JA_revenue']], on='fsn', how='inner')
-        .merge(attrs_pid, on='fsn', how='left')
+        .merge(ja_pid[['product_id', 'JA_units', 'JA_ASP', 'JA_revenue']], on='product_id', how='inner')
+        .merge(attrs_pid, on='product_id', how='left')
     )
 
-    # asp_bucket for fsn level: computed from daily product ASP
     if not df_dated_pid.empty:
-        _d1_asp_pid = (df_dated_pid['d-1_revenue'] / df_dated_pid['d-1_units']).replace([np.inf,-np.inf],np.nan).fillna(0)
+        _d1_asp_pid = (
+            (df_dated_pid['d-1_revenue'] / df_dated_pid['d-1_units'])
+            .replace([np.inf, -np.inf], np.nan).fillna(0)
+        )
         df_dated_pid['asp_bucket'] = assign_bucket(_d1_asp_pid)
 
-    # ── Compute weighted columns for both ─────────────────────────────────────
+    # ── Weighted columns ──────────────────────────────────────────────────────
     for df in [df_dated_unb, df_dated_pid]:
         if not df.empty:
             df['d-1_ASP'] = (
@@ -231,8 +243,7 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
             df['jaw_out'] = df['JA_ASP']  * df['d-1_units']
             df['d1w_out'] = df['d-1_revenue']
 
-    # ── Combine df_dated (lid + pid) ─────────────────────────────────────────
-    # Keep only shared columns before concat
+    # ── Combine ───────────────────────────────────────────────────────────────
     shared_cols = [
         'date', 'segment', 'super_category', 'vertical',
         'asp_bucket', 'JA_asp_bucket',
@@ -240,6 +251,7 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
         'd-1_units', 'd-1_revenue', 'd-1_ASP',
         'jaw', 'd1w', 'jaw_out', 'd1w_out',
     ]
+
     def safe_select(df, cols):
         return df[[c for c in cols if c in df.columns]]
 
@@ -300,8 +312,8 @@ with st.spinner("⏳ Loading — please wait..."):
 def filter_segment(data, seg, col='segment'):
     return data if seg == 'Overall' else data[data[col] == seg]
 
-basefile_seg = filter_segment(basefile,  segment)
-df_dated_seg = filter_segment(df_dated,  segment)
+basefile_seg = filter_segment(basefile, segment)
+df_dated_seg = filter_segment(df_dated, segment)
 
 
 # ── Pivot helpers ─────────────────────────────────────────────────────────────
@@ -367,7 +379,9 @@ def make_disc_pivot(data, group_col, label_col, jaw_col, d1w_col, unit_col,
               .reset_index())
     agg['Fixed_JA_ASP'] = (agg['jaw'] / agg['ju']).replace([np.inf,-np.inf],np.nan).fillna(0)
     agg['Fixed_d1_ASP'] = (agg['d1w'] / agg['ju']).replace([np.inf,-np.inf],np.nan).fillna(0)
-    agg['Disc%'] = ((agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100).replace([np.inf,-np.inf],np.nan).fillna(0)
+    agg['Disc%'] = (
+        (agg['Fixed_d1_ASP'] / agg['Fixed_JA_ASP'] - 1) * 100
+    ).replace([np.inf,-np.inf],np.nan).fillna(0)
 
     pivot = agg.pivot(index=group_col, columns='date', values='Disc%')
     pivot.columns = [str(c) for c in pivot.columns]
@@ -409,7 +423,7 @@ def render_asp_tab(title, jaw_col, d1w_col, unit_col, caption_suffix, sections):
 
     st.caption(
         f'Disc% = (Fixed d-1 ASP / Fixed JA ASP − 1) × 100  ·  {caption_suffix}  ·  {segment}  ·  '
-        'Alpha/Branded joined on fsn · Unbranded joined on listing_id'
+        'Alpha/Branded joined on product_id · Unbranded joined on listing_id'
     )
 
 
@@ -466,14 +480,20 @@ with tab5:
     if basefile_seg.empty:
         st.info(f'No data for **{segment}**.')
     else:
-        st.dataframe(style_pivot(compute_seller_pivot(basefile_seg), 'seller_id'), use_container_width=True)
+        st.dataframe(
+            style_pivot(compute_seller_pivot(basefile_seg), 'seller_id'),
+            use_container_width=True,
+        )
 
 with tab6:
     st.subheader('ASP Fixed by JA Units - Brand Level')
     if basefile_seg.empty:
         st.info(f'No data for **{segment}**.')
     else:
-        st.dataframe(style_pivot(compute_brand_pivot(basefile_seg), 'brand'), use_container_width=True)
+        st.dataframe(
+            style_pivot(compute_brand_pivot(basefile_seg), 'brand'),
+            use_container_width=True,
+        )
 
 with tab7:
     st.subheader('Basefile (Filtered by Date)')
