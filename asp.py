@@ -1,7 +1,10 @@
 import gc
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 st.set_page_config(page_title="LID Level ASP Dashboard", layout="wide")
 st.title("LID Level ASP Analysis Dashboard")
@@ -22,6 +25,10 @@ SEGMENT_OPTIONS = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha
 GREEN = "background-color: var(--bg-success); color: var(--text-success)"
 RED   = "background-color: var(--bg-danger);  color: var(--text-danger)"
 
+PARQUET_JA     = 'lid_JA.parquet'
+PARQUET_D1     = 'lid_d-1.parquet'
+PARQUET_LOOKUP = 'Lookup.parquet'
+
 
 def assign_bucket(asp_series):
     return pd.cut(
@@ -30,77 +37,106 @@ def assign_bucket(asp_series):
     ).astype(str)
 
 
-# ── File loading (runs once, shared across sessions) ──────────────────────────
+# ── One-time CSV → Parquet conversion ────────────────────────────────────────
+def needs_conversion():
+    return not all(os.path.exists(f) for f in [PARQUET_JA, PARQUET_D1, PARQUET_LOOKUP])
+
+
+def convert_csvs_to_parquet():
+    with st.status("⚙️ First-time setup: converting CSV files to Parquet for faster loading...", expanded=True) as status:
+
+        st.write("📄 Converting Lookup.csv...")
+        df = pd.read_csv("Lookup.csv", dtype=str)
+        df.columns = df.columns.str.strip()
+        df.to_parquet(PARQUET_LOOKUP, index=False)
+
+        st.write("📄 Converting lid_JA.csv...")
+        df = pd.read_csv("lid_JA.csv", dtype=str, low_memory=False)
+        df.columns = normalize(df.columns)
+        df.to_parquet(PARQUET_JA, index=False)
+
+        st.write("📄 Converting lid_d-1.csv (large file — please wait)...")
+        writer = None
+        for chunk in pd.read_csv("lid_d-1.csv", dtype=str, chunksize=100_000):
+            chunk.columns = normalize(chunk.columns)   # normalize once during conversion
+            table = pa.Table.from_pandas(chunk, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(PARQUET_D1, table.schema, compression='snappy')
+            writer.write_table(table)
+        if writer:
+            writer.close()
+
+        status.update(label="✅ Conversion complete — loading data now.", state="complete")
+
+
+if needs_conversion():
+    convert_csvs_to_parquet()
+    st.cache_resource.clear()   # ensure load_data re-runs with new Parquet files
+
+
+# ── File loading (runs once per deployment, reads from Parquet) ───────────────
 @st.cache_resource
 def load_data():
     id_cols    = ['listing_id', 'seller_id', 'seller_name', 'brand']
     extra_cols = ['super_category', 'vertical', 'alpha_flag', 'asp_bucket']
 
-    df_ja = pd.read_csv(
-        "lid_JA.csv", usecols=id_cols + ['units', 'gmv'], dtype=str, low_memory=False,
-    )
-    df_ja.columns = normalize(df_ja.columns)
+    # Discover available columns in Parquet (safe column selection)
+    _d1_schema   = pq.read_schema(PARQUET_D1).names
+    _d1_available = set(_d1_schema)
+
+    # ── JA ────────────────────────────────────────────────────────────────────
+    _ja_schema   = set(pq.read_schema(PARQUET_JA).names)
+    ja_cols      = [c for c in id_cols + ['units', 'gmv'] if c in _ja_schema]
+    df_ja = pd.read_parquet(PARQUET_JA, columns=ja_cols)
     df_ja['units'] = to_num(df_ja['units']).astype('float32')
     df_ja['gmv']   = to_num(df_ja['gmv']).astype('float32')
     df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
 
-    _peek    = pd.read_csv("lid_d-1.csv", nrows=0)
-    _col_map = dict(zip(normalize(_peek.columns), _peek.columns))
-    needed      = id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
-    usecols_act = [_col_map[n] for n in needed if n in _col_map]
-    rename_map  = {_col_map[n]: n for n in needed if n in _col_map}
+    # ── d-1: read all needed columns at once (Parquet handles this efficiently) ──
+    needed_d1 = id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
+    read_cols  = [c for c in needed_d1 if c in _d1_available]
+    df_d1_raw  = pd.read_parquet(PARQUET_D1, columns=read_cols)
 
-    d1_parts, meta_parts = [], []
-    for chunk in pd.read_csv("lid_d-1.csv", usecols=usecols_act, dtype=str, chunksize=100_000):
-        chunk = chunk.rename(columns=rename_map)
-        chunk['units']  = to_num(chunk['units']).astype('float32')
-        chunk['amount'] = to_num(chunk['amount']).astype('float32')
-        chunk['date']   = chunk['unit_creation_timestamp'].str.split('T').str[0]
-        chunk.drop(columns=['unit_creation_timestamp'], inplace=True)
-        d1_parts.append(
-            chunk.groupby(['listing_id', 'date'], as_index=False)
-                 .agg({'units': 'sum', 'amount': 'sum'})
-        )
-        meta_parts.append(chunk[id_cols + extra_cols].drop_duplicates('listing_id'))
+    df_d1_raw['units']  = to_num(df_d1_raw['units']).astype('float32')
+    df_d1_raw['amount'] = to_num(df_d1_raw['amount']).astype('float32')
+    df_d1_raw['date']   = df_d1_raw['unit_creation_timestamp'].str.split('T').str[0]
+    df_d1_raw.drop(columns=['unit_creation_timestamp'], inplace=True)
 
-    df_d1 = pd.concat(d1_parts, ignore_index=True)
-    del d1_parts; gc.collect()
-    df_d1 = df_d1.groupby(['listing_id', 'date'], as_index=False).agg({'units': 'sum', 'amount': 'sum'})
+    # Compact fact table: listing_id + date + units + revenue
+    df_d1 = (df_d1_raw.groupby(['listing_id', 'date'], as_index=False)
+                       .agg({'units': 'sum', 'amount': 'sum'}))
     df_d1 = df_d1.rename(columns={'units': 'd-1_units', 'amount': 'd-1_revenue'})
     df_d1['date']        = pd.to_datetime(df_d1['date'], errors='coerce').dt.date
     df_d1['d-1_units']   = df_d1['d-1_units'].astype('float32')
     df_d1['d-1_revenue'] = df_d1['d-1_revenue'].astype('float32')
     df_d1.dropna(subset=['date'], inplace=True)
 
-    lid_meta = pd.concat(meta_parts, ignore_index=True).drop_duplicates('listing_id').reset_index(drop=True)
-    del meta_parts; gc.collect()
-    for col in id_cols + extra_cols:
-        if col in lid_meta.columns:
+    # lid_meta: one row per listing_id with all attributes
+    meta_cols = [c for c in id_cols + extra_cols if c in _d1_available]
+    lid_meta  = df_d1_raw[meta_cols].drop_duplicates('listing_id').reset_index(drop=True)
+    del df_d1_raw; gc.collect()
+
+    for col in meta_cols:
+        if lid_meta[col].dtype == object:
             lid_meta[col] = lid_meta[col].str.strip().astype('category')
 
-    df_lookup = pd.read_csv("Lookup.csv", dtype=str)
-    df_lookup.columns = df_lookup.columns.str.strip()
+    # ── Lookup ────────────────────────────────────────────────────────────────
+    df_lookup = pd.read_parquet(PARQUET_LOOKUP)
     df_lookup['Brand']     = df_lookup['Brand'].str.strip()
     df_lookup['Brand_Tag'] = df_lookup['Brand_Tag'].str.strip()
 
     return df_ja, df_d1, lid_meta, df_lookup
 
 
-# ── Date-range computation (cached per date range — skips re-run on tab/segment switch) ──
+# ── Date-range computation (cached per date range) ────────────────────────────
 @st.cache_data
 def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, end_date):
-    """
-    Heavy computation. Cached by (start_date, end_date).
-    Underscore-prefixed args are not hashed (they come from cache_resource).
-    """
-    # Aggregate d-1 over date range
     df_d1_agg = (
         _df_d1[(_df_d1['date'] >= start_date) & (_df_d1['date'] <= end_date)]
         .groupby('listing_id', as_index=False)
         .agg({'d-1_units': 'sum', 'd-1_revenue': 'sum'})
     )
 
-    # Basefile (common LIDs)
     basefile = pd.merge(_df_ja, df_d1_agg, on='listing_id', how='inner')
     basefile['JA_ASP'] = (
         (basefile['JA_revenue'] / basefile['JA_units'])
@@ -114,7 +150,6 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
     basefile['d-1_ASP*JA_units'] = basefile['d-1_ASP'] * basefile['JA_units']
     basefile['JA_asp_bucket']    = assign_bucket(basefile['JA_ASP'])
 
-    # LID attrs (all common LIDs)
     common_lids = set(basefile['listing_id'])
     lid_attrs = (
         _lid_meta[_lid_meta['listing_id'].isin(common_lids)]
@@ -134,11 +169,7 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
     basefile['segment']        = basefile['listing_id'].map(_seg_map)
     lid_attrs['JA_asp_bucket'] = lid_attrs['listing_id'].map(_ja_bucket_map).fillna('Unknown')
 
-    # df_dated (all common LIDs, daily)
-    _ja_ref = (
-        basefile[['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue']]
-        .drop_duplicates('listing_id')
-    )
+    _ja_ref = basefile[['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue']].drop_duplicates('listing_id')
     _attr_cols = lid_attrs[
         ['listing_id', 'super_category', 'vertical', 'asp_bucket', 'JA_asp_bucket', 'segment']
     ].copy()
@@ -168,7 +199,7 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
     return basefile, df_dated
 
 
-# ── Load files ────────────────────────────────────────────────────────────────
+# ── Load ──────────────────────────────────────────────────────────────────────
 df_ja, df_d1, lid_meta, df_lookup = load_data()
 _lookup_map = df_lookup.drop_duplicates('Brand').set_index('Brand')['Brand_Tag']
 
@@ -188,9 +219,8 @@ with st.sidebar.form("date_filter_form"):
     )
     refresh = st.form_submit_button("🔄 Refresh Data", use_container_width=True)
 
-st.sidebar.caption("Select dates and click Refresh. Wait for the app to finish loading before clicking again.")
+st.sidebar.caption("Click Refresh once and wait for the spinner to finish.")
 
-# Segment dropdown (outside form — instant refilter, no heavy recomputation)
 segment = st.sidebar.selectbox("Segment:", options=SEGMENT_OPTIONS)
 
 if refresh:
@@ -200,26 +230,26 @@ if refresh:
         st.session_state['applied_range'] = (start_input, end_input)
 
 if 'applied_range' not in st.session_state:
-    st.info("👈 Select a Start Date and End Date in the sidebar, then click **Refresh Data**.")
+    st.info("👈 Select a date range in the sidebar and click **Refresh Data**.")
     st.stop()
 
 start_date, end_date = st.session_state['applied_range']
-st.caption(f"Showing d-1 data from **{start_date}** to **{end_date}** · Segment: **{segment}**")
+st.caption(f"d-1 data: **{start_date}** → **{end_date}**  ·  Segment: **{segment}**")
 
 
-# ── Heavy computation (cached by date range) ──────────────────────────────────
-with st.spinner("⏳ Loading data — please wait..."):
+# ── Compute (cached by date range) ───────────────────────────────────────────
+with st.spinner("⏳ Loading — please wait..."):
     basefile, df_dated = compute_for_date_range(
         df_ja, df_d1, lid_meta, _lookup_map, start_date, end_date
     )
 
 
-# ── Segment filter (fast — applied after cache) ───────────────────────────────
+# ── Segment filter (instant) ──────────────────────────────────────────────────
 def filter_segment(data, seg, col='segment'):
     return data if seg == 'Overall' else data[data[col] == seg]
 
-basefile_seg  = filter_segment(basefile,  segment)
-df_dated_seg  = filter_segment(df_dated,  segment)
+basefile_seg = filter_segment(basefile,  segment)
+df_dated_seg = filter_segment(df_dated,  segment)
 
 
 # ── Pivot helpers ─────────────────────────────────────────────────────────────
