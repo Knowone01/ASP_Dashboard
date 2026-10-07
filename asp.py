@@ -22,8 +22,8 @@ BUCKET_BINS     = [0, 200, 300, 500, 1000, np.inf]
 BUCKET_LABELS   = ['0-200', '200-300', '300-500', '500-1000', 'Above 1000']
 SEGMENT_OPTIONS = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
 
-GREEN = "background-color: var(--bg-success); color: var(--text-success)"
-RED   = "background-color: var(--bg-danger);  color: var(--text-danger)"
+GREEN = "background-color: #d1e7dd; color: #0f5132"
+RED   = "background-color: #f8d7da; color: #842029"
 
 PARQUET_JA     = 'lid_JA.parquet'
 PARQUET_D1     = 'lid_d-1.parquet'
@@ -58,7 +58,7 @@ def convert_csvs_to_parquet():
         st.write("📄 Converting lid_d-1.csv (large file — please wait)...")
         writer = None
         for chunk in pd.read_csv("lid_d-1.csv", dtype=str, chunksize=100_000):
-            chunk.columns = normalize(chunk.columns)   # normalize once during conversion
+            chunk.columns = normalize(chunk.columns)
             table = pa.Table.from_pandas(chunk, preserve_index=False)
             if writer is None:
                 writer = pq.ParquetWriter(PARQUET_D1, table.schema, compression='snappy')
@@ -71,29 +71,27 @@ def convert_csvs_to_parquet():
 
 if needs_conversion():
     convert_csvs_to_parquet()
-    st.cache_resource.clear()   # ensure load_data re-runs with new Parquet files
+    st.cache_resource.clear()
 
 
-# ── File loading (runs once per deployment, reads from Parquet) ───────────────
+# ── File loading (once per deployment) ───────────────────────────────────────
 @st.cache_resource
 def load_data():
     id_cols    = ['listing_id', 'seller_id', 'seller_name', 'brand']
     extra_cols = ['super_category', 'vertical', 'alpha_flag', 'asp_bucket']
 
-    # Discover available columns in Parquet (safe column selection)
-    _d1_schema   = pq.read_schema(PARQUET_D1).names
-    _d1_available = set(_d1_schema)
+    _d1_available = set(pq.read_schema(PARQUET_D1).names)
+    _ja_available = set(pq.read_schema(PARQUET_JA).names)
 
     # ── JA ────────────────────────────────────────────────────────────────────
-    _ja_schema   = set(pq.read_schema(PARQUET_JA).names)
-    ja_cols      = [c for c in id_cols + ['units', 'gmv'] if c in _ja_schema]
-    df_ja = pd.read_parquet(PARQUET_JA, columns=ja_cols)
+    ja_cols = [c for c in id_cols + ['units', 'gmv'] if c in _ja_available]
+    df_ja   = pd.read_parquet(PARQUET_JA, columns=ja_cols)
     df_ja['units'] = to_num(df_ja['units']).astype('float32')
     df_ja['gmv']   = to_num(df_ja['gmv']).astype('float32')
     df_ja = df_ja.rename(columns={'units': 'JA_units', 'gmv': 'JA_revenue'})
 
-    # ── d-1: read all needed columns at once (Parquet handles this efficiently) ──
-    needed_d1 = id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
+    # ── d-1 ───────────────────────────────────────────────────────────────────
+    needed_d1  = id_cols + extra_cols + ['unit_creation_timestamp', 'units', 'amount']
     read_cols  = [c for c in needed_d1 if c in _d1_available]
     df_d1_raw  = pd.read_parquet(PARQUET_D1, columns=read_cols)
 
@@ -102,7 +100,6 @@ def load_data():
     df_d1_raw['date']   = df_d1_raw['unit_creation_timestamp'].str.split('T').str[0]
     df_d1_raw.drop(columns=['unit_creation_timestamp'], inplace=True)
 
-    # Compact fact table: listing_id + date + units + revenue
     df_d1 = (df_d1_raw.groupby(['listing_id', 'date'], as_index=False)
                        .agg({'units': 'sum', 'amount': 'sum'}))
     df_d1 = df_d1.rename(columns={'units': 'd-1_units', 'amount': 'd-1_revenue'})
@@ -111,7 +108,6 @@ def load_data():
     df_d1['d-1_revenue'] = df_d1['d-1_revenue'].astype('float32')
     df_d1.dropna(subset=['date'], inplace=True)
 
-    # lid_meta: one row per listing_id with all attributes
     meta_cols = [c for c in id_cols + extra_cols if c in _d1_available]
     lid_meta  = df_d1_raw[meta_cols].drop_duplicates('listing_id').reset_index(drop=True)
     del df_d1_raw; gc.collect()
@@ -164,12 +160,12 @@ def compute_for_date_range(_df_ja, _df_d1, _lid_meta, _lookup_map, start_date, e
     lid_attrs.loc[ _is_non_alpha &  _is_unbranded, 'segment'] = 'Unbranded Non-Alpha'
     lid_attrs.loc[ _is_non_alpha & ~_is_unbranded, 'segment'] = 'Branded Non-Alpha'
 
-    _seg_map           = lid_attrs.set_index('listing_id')['segment']
-    _ja_bucket_map     = basefile.set_index('listing_id')['JA_asp_bucket']
+    _seg_map               = lid_attrs.set_index('listing_id')['segment']
+    _ja_bucket_map         = basefile.set_index('listing_id')['JA_asp_bucket']
     basefile['segment']        = basefile['listing_id'].map(_seg_map)
     lid_attrs['JA_asp_bucket'] = lid_attrs['listing_id'].map(_ja_bucket_map).fillna('Unknown')
 
-    _ja_ref = basefile[['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue']].drop_duplicates('listing_id')
+    _ja_ref    = basefile[['listing_id', 'JA_units', 'JA_ASP', 'JA_revenue']].drop_duplicates('listing_id')
     _attr_cols = lid_attrs[
         ['listing_id', 'super_category', 'vertical', 'asp_bucket', 'JA_asp_bucket', 'segment']
     ].copy()
@@ -237,7 +233,7 @@ start_date, end_date = st.session_state['applied_range']
 st.caption(f"d-1 data: **{start_date}** → **{end_date}**  ·  Segment: **{segment}**")
 
 
-# ── Compute (cached by date range) ───────────────────────────────────────────
+# ── Compute (cached by date range) ────────────────────────────────────────────
 with st.spinner("⏳ Loading — please wait..."):
     basefile, df_dated = compute_for_date_range(
         df_ja, df_d1, lid_meta, _lookup_map, start_date, end_date
@@ -248,8 +244,8 @@ with st.spinner("⏳ Loading — please wait..."):
 def filter_segment(data, seg, col='segment'):
     return data if seg == 'Overall' else data[data[col] == seg]
 
-basefile_seg = filter_segment(basefile,  segment)
-df_dated_seg = filter_segment(df_dated,  segment)
+basefile_seg = filter_segment(basefile, segment)
+df_dated_seg = filter_segment(df_dated, segment)
 
 
 # ── Pivot helpers ─────────────────────────────────────────────────────────────
@@ -282,9 +278,10 @@ def compute_brand_pivot(bf):
 # ── Stylers ───────────────────────────────────────────────────────────────────
 def style_pivot(df, index_col):
     df = df.set_index(index_col)
+    num_cols = df.select_dtypes(include='number').columns.tolist()
     def color_disc(v):
         return GREEN if v < 0 else RED
-    styler = df.style.format(precision=2)
+    styler = df.style.format({c: '{:.2f}' for c in num_cols})
     fn = styler.map if hasattr(styler, 'map') else styler.applymap
     return fn(color_disc, subset=['Disc %'])
 
