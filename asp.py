@@ -10,7 +10,7 @@ RED   = "background-color: #f8d7da; color: #842029"
 
 BUCKET_LABELS    = ['0-200', '200-300', '300-500', '500-1000', 'Above 1000']
 SEGMENT_OPTIONS  = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
-TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWestern Growth']
+TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
 
 NUM_COLS = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
 
@@ -27,9 +27,8 @@ def load_csv(filepath):
                 df[col].str.replace(',', '', regex=False), errors='coerce'
             ).fillna(0).astype('float32')
 
-    # Convert date to readable string: 20260924 → "24 Sep"
-    df['date_'] = (pd.to_datetime(df['date_'].str.strip(), format='%Y%m%d', errors='coerce')
-                     .dt.strftime('%d %b'))
+    # Keep as YYYYMMDD string — sorts correctly as plain string, converted to display in pivot
+    df['date_'] = df['date_'].str.strip()
 
     # Normalize segment columns
     df['alpha_flag']   = df['alpha_flag'].str.strip().str.upper()
@@ -60,7 +59,12 @@ if df_raw.empty:
 segment = st.sidebar.selectbox("Segment:", options=SEGMENT_OPTIONS)
 
 available_dates = sorted(df_raw['date_'].dropna().unique())
-st.sidebar.caption(f"Dates found: {', '.join(available_dates)}")
+display_dates = [
+    pd.to_datetime(d, format='%Y%m%d').strftime('%d %b')
+    if str(d).isdigit() and len(str(d)) == 8 else d
+    for d in available_dates
+]
+st.sidebar.caption(f"Dates found: {', '.join(display_dates)}")
 
 
 # ── Segment filter ────────────────────────────────────────────────────────────
@@ -99,14 +103,16 @@ def make_pivot(data, group_col, label_col, num_col, den_col,
     pivot = agg.pivot(index=group_col, columns='date_', values='disc')
     pivot.columns.name = None
 
-    # Sort date columns chronologically
-    def sort_key(d):
-        try:
-            return pd.to_datetime(d, format='%d %b', errors='coerce')
-        except Exception:
-            return d
+    # YYYYMMDD strings sort correctly as plain strings
+    pivot = pivot[sorted(pivot.columns)]
 
-    pivot = pivot[sorted(pivot.columns, key=sort_key)]
+    # Rename to display format: "20260924" → "24 Sep"
+    pivot.columns = [
+        pd.to_datetime(c, format='%Y%m%d').strftime('%d %b')
+        if str(c).isdigit() and len(str(c)) == 8 else c
+        for c in pivot.columns
+    ]
+
     pivot = pivot.reset_index().rename(columns={group_col: label_col})
 
     if sort_order is not None:
@@ -128,8 +134,14 @@ def make_pivot(data, group_col, label_col, num_col, den_col,
 
     overall_row = {label_col: 'Overall'}
     for _, r in overall_agg.iterrows():
-        if r['date_'] in date_cols:
-            overall_row[r['date_']] = r['disc']
+        # Convert YYYYMMDD key to display format to match renamed pivot columns
+        display_date = (
+            pd.to_datetime(r['date_'], format='%Y%m%d').strftime('%d %b')
+            if str(r['date_']).isdigit() and len(str(r['date_'])) == 8
+            else r['date_']
+        )
+        if display_date in date_cols:
+            overall_row[display_date] = r['disc']
 
     pivot = pd.concat(
         [pd.DataFrame([overall_row]), pivot],
