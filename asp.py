@@ -10,9 +10,8 @@ RED   = "background-color: #f8d7da; color: #842029"
 
 BUCKET_LABELS    = ['0-200', '200-300', '300-500', '500-1000', 'Above 1000']
 SEGMENT_OPTIONS  = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
-TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
-
-NUM_COLS = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
+TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWestern Growth']
+NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -27,47 +26,36 @@ def load_csv(filepath):
                 df[col].str.replace(',', '', regex=False), errors='coerce'
             ).fillna(0).astype('float32')
 
-    # Keep as YYYYMMDD string — sorts correctly as plain string, converted to display in pivot
-    df['date_'] = df['date_'].str.strip()
-
-    # Normalize segment columns
-    df['alpha_flag']   = df['alpha_flag'].str.strip().str.upper()
-    df['branded_flag'] = df['branded_flag'].str.strip()
+    # Keep as YYYYMMDD string — sorts correctly as plain string
+    df['date_']          = df['date_'].str.strip()
+    df['alpha_flag']     = df['alpha_flag'].str.strip().str.upper()
+    df['branded_flag']   = df['branded_flag'].str.strip()
     df['super_category'] = df['super_category'].str.strip()
     df['vertical']       = df['vertical'].str.strip()
     df['ja_asp_bucket']  = df['ja_asp_bucket'].str.strip()
     df['d1_asp_bucket']  = df['d1_asp_bucket'].str.strip()
 
-    # Filter to target super categories only
-    df = df[df['super_category'].isin(TARGET_SUPERCATS)]
+    return df[df['super_category'].isin(TARGET_SUPERCATS)]
 
-    return df
+
+def fmt_date(d):
+    """YYYYMMDD string → '24 Sep' display string."""
+    try:
+        return pd.to_datetime(str(d), format='%Y%m%d').strftime('%d %b')
+    except Exception:
+        return str(d)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.header("Filters")
-
-df_raw = load_csv("data.csv")
-
-if df_raw.empty:
-    st.warning(
-        f"No data found for super categories: {TARGET_SUPERCATS}. "
-        "Check the exact values in your `super_category` column."
-    )
-    st.stop()
-
 segment = st.sidebar.selectbox("Segment:", options=SEGMENT_OPTIONS)
 
-available_dates = sorted(df_raw['date_'].dropna().unique())
-display_dates = [
-    pd.to_datetime(d, format='%Y%m%d').strftime('%d %b')
-    if str(d).isdigit() and len(str(d)) == 8 else d
-    for d in available_dates
-]
-st.sidebar.caption(f"Dates found: {', '.join(display_dates)}")
+
+# ── Load both years ───────────────────────────────────────────────────────────
+df_2026 = load_csv("data.csv")
+df_2025 = load_csv("data_2025.csv")
 
 
-# ── Segment filter ────────────────────────────────────────────────────────────
 def filter_segment(df, seg):
     if seg == 'Overall':
         return df
@@ -79,12 +67,10 @@ def filter_segment(df, seg):
         return df[(df['alpha_flag'] == 'FALSE') & (df['branded_flag'] == 'Unbranded')]
     return df
 
-df = filter_segment(df_raw, segment)
-st.caption(f"Segment: **{segment}**  ·  Super categories: {', '.join(TARGET_SUPERCATS)}")
+df26 = filter_segment(df_2026, segment)
+df25 = filter_segment(df_2025, segment)
 
-if df.empty:
-    st.warning(f"No data for segment **{segment}**.")
-    st.stop()
+st.caption(f"Segment: **{segment}**  ·  Super categories: {', '.join(TARGET_SUPERCATS)}")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -97,22 +83,16 @@ def make_pivot(data, group_col, label_col, num_col, den_col,
 
     agg = (sub.groupby([group_col, 'date_'], as_index=False)
               .agg(num=(num_col, 'sum'), den=(den_col, 'sum'), gmv=('gmv', 'sum')))
-
     agg['disc'] = (agg['num'] / agg['den'].replace(0, np.nan)).fillna(0) * 100
 
     pivot = agg.pivot(index=group_col, columns='date_', values='disc')
     pivot.columns.name = None
 
-    # YYYYMMDD strings sort correctly as plain strings
+    # Sort YYYYMMDD strings — correct order guaranteed
     pivot = pivot[sorted(pivot.columns)]
 
-    # Rename to display format: "20260924" → "24 Sep"
-    pivot.columns = [
-        pd.to_datetime(c, format='%Y%m%d').strftime('%d %b')
-        if str(c).isdigit() and len(str(c)) == 8 else c
-        for c in pivot.columns
-    ]
-
+    # Rename columns to display format
+    pivot.columns = [fmt_date(c) for c in pivot.columns]
     pivot = pivot.reset_index().rename(columns={group_col: label_col})
 
     if sort_order is not None:
@@ -124,30 +104,18 @@ def make_pivot(data, group_col, label_col, num_col, den_col,
                         .sort_values('gmv', ascending=False))
         pivot = gmv_order[[label_col]].merge(pivot, on=label_col, how='left')
 
-    # Overall row: sum num and den across all rows per date, then divide
-    date_cols = [c for c in pivot.columns if c != label_col]
-    overall_agg = (sub.groupby('date_', as_index=False)
-                      .agg(num=(num_col, 'sum'), den=(den_col, 'sum')))
-    overall_agg['disc'] = (
-        overall_agg['num'] / overall_agg['den'].replace(0, np.nan)
-    ).fillna(0) * 100
+    # Overall row at top
+    date_cols    = [c for c in pivot.columns if c != label_col]
+    overall_agg  = sub.groupby('date_', as_index=False).agg(num=(num_col, 'sum'), den=(den_col, 'sum'))
+    overall_agg['disc'] = (overall_agg['num'] / overall_agg['den'].replace(0, np.nan)).fillna(0) * 100
 
     overall_row = {label_col: 'Overall'}
     for _, r in overall_agg.iterrows():
-        # Convert YYYYMMDD key to display format to match renamed pivot columns
-        display_date = (
-            pd.to_datetime(r['date_'], format='%Y%m%d').strftime('%d %b')
-            if str(r['date_']).isdigit() and len(str(r['date_'])) == 8
-            else r['date_']
-        )
-        if display_date in date_cols:
-            overall_row[display_date] = r['disc']
+        d = fmt_date(r['date_'])
+        if d in date_cols:
+            overall_row[d] = r['disc']
 
-    pivot = pd.concat(
-        [pd.DataFrame([overall_row]), pivot],
-        ignore_index=True
-    )
-
+    pivot = pd.concat([pd.DataFrame([overall_row]), pivot], ignore_index=True)
     return pivot
 
 
@@ -164,14 +132,13 @@ def style_disc(df, label_col):
     return fn(color, subset=date_cols)
 
 
-def render_tab(title, num_col, den_col, sections, caption_suffix):
-    st.subheader(title)
-    if df.empty:
+def render_sections(data, sections, num_col, den_col):
+    """Render a list of (group_col, label_col, sort_by_gmv, sort_order) sections."""
+    if data.empty:
         st.info(f'No data for **{segment}**.')
         return
-
     for i, (group_col, label_col, sort_by_gmv, sort_order) in enumerate(sections):
-        pivot = make_pivot(df, group_col, label_col, num_col, den_col, sort_by_gmv, sort_order)
+        pivot = make_pivot(data, group_col, label_col, num_col, den_col, sort_by_gmv, sort_order)
         if not pivot.empty:
             st.markdown(f'**{label_col}**')
             st.dataframe(style_disc(pivot, label_col), use_container_width=True)
@@ -180,7 +147,23 @@ def render_tab(title, num_col, den_col, sections, caption_suffix):
         if i < len(sections) - 1:
             st.divider()
 
-    st.caption(f'Disc% = {num_col} / {den_col} × 100  ·  {segment}  ·  {caption_suffix}')
+
+def render_bucket_tab(num_col, den_col):
+    """Show 2026 super_category + bucket, then 2025 super_category + bucket below."""
+    BUCKET_SECTIONS = [
+        ('super_category', 'Super Category', False, None),
+        ('ja_asp_bucket',  'JA ASP Bucket',  False, BUCKET_LABELS),
+    ]
+
+    st.markdown('### 2026')
+    render_sections(df26, BUCKET_SECTIONS, num_col, den_col)
+
+    st.divider()
+
+    st.markdown('### 2025')
+    render_sections(df25, BUCKET_SECTIONS, num_col, den_col)
+
+    st.caption(f'Disc% = {num_col} / {den_col} × 100  ·  {segment}')
 
 
 # ── Section definitions ───────────────────────────────────────────────────────
@@ -188,50 +171,39 @@ SC_V_SECTIONS = [
     ('super_category', 'Super Category', False, None),
     ('vertical',       'Vertical',       True,  None),
 ]
-OUTPUT_BUCKET_SECTIONS = [
-    ('super_category', 'Super Category', False, None),
-    ('ja_asp_bucket',  'JA ASP Bucket',  False, BUCKET_LABELS),
-]
-INPUT_BUCKET_SECTIONS = [
-    ('super_category', 'Super Category', False, None),
-    ('ja_asp_bucket',  'JA ASP Bucket',  False, BUCKET_LABELS),
-]
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
-    'Output ASP', 'Input ASP',
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    'Output ASP 2026', 'Output ASP 2025',
+    'Input ASP 2026',  'Input ASP 2025',
     'Output ASP (JA Bucket)', 'Input ASP (JA Bucket)',
 ])
 
 with tab1:
-    render_tab(
-        title='Output ASP Disc% — Fixed by d-1 Units',
-        num_col='num_op_u', den_col='den_op_u',
-        sections=SC_V_SECTIONS,
-        caption_suffix='verticals sorted by GMV',
-    )
+    st.subheader('Output ASP Disc% — 2026')
+    render_sections(df26, SC_V_SECTIONS, 'num_op_u', 'den_op_u')
+    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  verticals sorted by GMV')
 
 with tab2:
-    render_tab(
-        title='Input ASP Disc% — Fixed by JA Units',
-        num_col='num_ip_u', den_col='den_ip_u',
-        sections=SC_V_SECTIONS,
-        caption_suffix='verticals sorted by GMV',
-    )
+    st.subheader('Output ASP Disc% — 2025')
+    render_sections(df25, SC_V_SECTIONS, 'num_op_u', 'den_op_u')
+    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  verticals sorted by GMV')
 
 with tab3:
-    render_tab(
-        title='Output ASP Disc% — JA ASP Bucket (Fixed by d-1 Units)',
-        num_col='num_op_u', den_col='den_op_u',
-        sections=OUTPUT_BUCKET_SECTIONS,
-        caption_suffix='bucket order: 0-200 → Above 1000',
-    )
+    st.subheader('Input ASP Disc% — 2026')
+    render_sections(df26, SC_V_SECTIONS, 'num_ip_u', 'den_ip_u')
+    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  verticals sorted by GMV')
 
 with tab4:
-    render_tab(
-        title='Input ASP Disc% — JA ASP Bucket (Fixed by JA Units)',
-        num_col='num_ip_u', den_col='den_ip_u',
-        sections=INPUT_BUCKET_SECTIONS,
-        caption_suffix='bucket order: 0-200 → Above 1000',
-    )
+    st.subheader('Input ASP Disc% — 2025')
+    render_sections(df25, SC_V_SECTIONS, 'num_ip_u', 'den_ip_u')
+    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  verticals sorted by GMV')
+
+with tab5:
+    st.subheader('Output ASP Disc% — JA ASP Bucket (Fixed by d-1 Units)')
+    render_bucket_tab('num_op_u', 'den_op_u')
+
+with tab6:
+    st.subheader('Input ASP Disc% — JA ASP Bucket (Fixed by JA Units)')
+    render_bucket_tab('num_ip_u', 'den_ip_u')
