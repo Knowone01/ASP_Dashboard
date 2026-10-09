@@ -38,6 +38,7 @@ def load_csv(filepath):
     df['vertical']       = df['vertical'].str.strip()
     df['ja_asp_bucket']  = df['ja_asp_bucket'].str.strip()
     df['d1_asp_bucket']  = df['d1_asp_bucket'].str.strip()
+    df['brand']          = df['brand'].str.strip() if 'brand' in df.columns else ''
 
     return df[df['super_category'].isin(TARGET_SUPERCATS)]
 
@@ -182,6 +183,11 @@ BKT_SECTIONS = [
     ('ja_asp_bucket', 'JA ASP Bucket', False, BUCKET_ORDER_FULL, EXTRA_BUCKETS),
 ]
 
+# Brand section, sorted by GMV
+BRAND_SECTIONS = [
+    ('brand', 'Brand', True, None),
+]
+
 
 # ── Bucket tab renderer ───────────────────────────────────────────────────────
 def render_bucket_tab(num_col, den_col):
@@ -212,10 +218,12 @@ def render_bucket_tab(num_col, den_col):
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
     'Output ASP 2026', 'Output ASP 2025',
     'Input ASP 2026',  'Input ASP 2025',
     'Output ASP (JA Bucket)', 'Input ASP (JA Bucket)',
+    'Output ASP Brand 2026', 'Output ASP Brand 2025',
+    'Input ASP Brand 2026',  'Input ASP Brand 2025',
 ])
 
 with tab1:
@@ -245,3 +253,23 @@ with tab5:
 with tab6:
     st.subheader('Input ASP Disc% — JA ASP Bucket (Fixed by JA Units)')
     render_bucket_tab('num_ip_u', 'den_ip_u')
+
+with tab7:
+    st.subheader('Output ASP Disc% — Brand — 2026')
+    render_sections(df26, BRAND_SECTIONS, 'num_op_u', 'den_op_u')
+    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  brands sorted by GMV')
+
+with tab8:
+    st.subheader('Output ASP Disc% — Brand — 2025')
+    render_sections(df25, BRAND_SECTIONS, 'num_op_u', 'den_op_u')
+    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  brands sorted by GMV')
+
+with tab9:
+    st.subheader('Input ASP Disc% — Brand — 2026')
+    render_sections(df26, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
+    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  brands sorted by GMV')
+
+with tab10:
+    st.subheader('Input ASP Disc% — Brand — 2025')
+    render_sections(df25, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
+    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  brands sorted by GMV')
