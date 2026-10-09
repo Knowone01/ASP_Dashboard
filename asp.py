@@ -10,7 +10,7 @@ RED   = "background-color: #f8d7da; color: #842029"
 
 BUCKET_LABELS    = ['0-200', '200-300', '300-500', '500-1000', 'Above 1000']
 SEGMENT_OPTIONS  = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
-TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWestern Growth']
+TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
 NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
 
 
