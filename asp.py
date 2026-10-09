@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
+pd.set_option("styler.render.max_elements", 50_000_000)
+
 st.set_page_config(page_title="ASP Disc% Dashboard", layout="wide")
 st.title("ASP Discount % Dashboard")
 
@@ -17,6 +19,7 @@ EXTRA_BUCKETS     = [
 SEGMENT_OPTIONS  = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
 TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
 NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
+TOP_N_BRANDS     = 100
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -122,9 +125,11 @@ def make_pivot(data, group_col, label_col, num_col, den_col,
         gmv_order = (sub.groupby(group_col)['gmv'].sum().reset_index()
                         .rename(columns={group_col: label_col})
                         .sort_values('gmv', ascending=False))
+        if group_col == 'brand':
+            gmv_order = gmv_order.head(TOP_N_BRANDS)
         pivot = gmv_order[[label_col]].merge(pivot, on=label_col, how='left')
 
-    # Overall row at top
+    # Overall row at top (computed from all rows, incl. brands beyond top N)
     date_cols   = [c for c in pivot.columns if c != label_col]
     overall_agg = sub.groupby('date_', as_index=False).agg(num=(num_col,'sum'), den=(den_col,'sum'))
     overall_agg['disc'] = (overall_agg['num'] / overall_agg['den'].replace(0, np.nan)).fillna(0) * 100
@@ -178,12 +183,10 @@ SC_V_SECTIONS = [
     ('vertical',       'Vertical',       True,  None),
 ]
 
-# Bucket sections include derived rows and full sort order
 BKT_SECTIONS = [
     ('ja_asp_bucket', 'JA ASP Bucket', False, BUCKET_ORDER_FULL, EXTRA_BUCKETS),
 ]
 
-# Brand section, sorted by GMV
 BRAND_SECTIONS = [
     ('brand', 'Brand', True, None),
 ]
@@ -257,19 +260,19 @@ with tab6:
 with tab7:
     st.subheader('Output ASP Disc% — Brand — 2026')
     render_sections(df26, BRAND_SECTIONS, 'num_op_u', 'den_op_u')
-    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  brands sorted by GMV')
+    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
 
 with tab8:
     st.subheader('Output ASP Disc% — Brand — 2025')
     render_sections(df25, BRAND_SECTIONS, 'num_op_u', 'den_op_u')
-    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  brands sorted by GMV')
+    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
 
 with tab9:
     st.subheader('Input ASP Disc% — Brand — 2026')
     render_sections(df26, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
-    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  brands sorted by GMV')
+    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
 
 with tab10:
     st.subheader('Input ASP Disc% — Brand — 2025')
     render_sections(df25, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
-    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  brands sorted by GMV')
+    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
