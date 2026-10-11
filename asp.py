@@ -21,6 +21,11 @@ TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
 NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
 TOP_N_BRANDS     = 100
 
+# BBD like-to-like windows (inclusive, YYYYMMDD strings)
+BBD_RANGE_26 = ('20261008', '20261231')
+BBD_RANGE_25 = ('20250922', '20251002')
+EXCLUDED_BRANDS = {'', 'unknown'}
+
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 @st.cache_data
@@ -149,10 +154,13 @@ def style_disc(df, label_col):
     date_cols = df.columns.tolist()
     def color(v):
         try:
-            return GREEN if float(v) < 0 else RED
+            f = float(v)
+            if np.isnan(f):
+                return ""
+            return GREEN if f < 0 else RED
         except (TypeError, ValueError):
             return ""
-    s  = df.style.format({c: '{:.2f}%' for c in date_cols})
+    s  = df.style.format({c: '{:.2f}%' for c in date_cols}, na_rep='-')
     fn = s.map if hasattr(s, 'map') else s.applymap
     return fn(color, subset=date_cols)
 
@@ -220,13 +228,25 @@ def render_bucket_tab(num_col, den_col):
     )
 
 
+# ── BBD like-to-like helpers ──────────────────────────────────────────────────
+def bbd_dates(df, rng):
+    return sorted(d for d in df['date_'].unique() if rng[0] <= str(d) <= rng[1])
+
+
+def brand_daily_disc(df, brand, dates, num_col, den_col):
+    b   = df[(df['brand'] == brand) & (df['date_'].isin(dates))]
+    agg = b.groupby('date_').agg(num=(num_col, 'sum'), den=(den_col, 'sum'))
+    return (agg['num'] / agg['den'].replace(0, np.nan)) * 100   # NaN kept -> shown as '-'
+
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    'Output ASP 2026 (Vertical Level)', 'Output ASP 2025 (Vertical Level)',
-    'Input ASP 2026 (Vertical Level)',  'Input ASP 2025 (Vertical Level)',
-    'Output ASP (Price Bucket Level)', 'Input ASP (Price Bucket Level)',
-    'Output ASP 2026 (Brand Level)', 'Output ASP Brand 2025 (Brand Level)',
-    'Input ASP Brand 2026 (Brand Level)',  'Input ASP Brand 2025 (Brand Level)',
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    'Output ASP 2026', 'Output ASP 2025',
+    'Input ASP 2026',  'Input ASP 2025',
+    'Output ASP (JA Bucket)', 'Input ASP (JA Bucket)',
+    'Output ASP Brand 2026', 'Output ASP Brand 2025',
+    'Input ASP Brand 2026',  'Input ASP Brand 2025',
+    'BBD Like-to-Like'
 ])
 
 with tab1:
@@ -276,3 +296,53 @@ with tab10:
     st.subheader('Input ASP Disc% — Brand — 2025')
     render_sections(df25, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
     st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
+
+with tab11:
+    st.subheader("BBD Like-to-Like Comparison")
+
+    all_brands = sorted(
+        b for b in (set(df26['brand'].dropna().unique()) | set(df25['brand'].dropna().unique()))
+        if b.strip().lower() not in EXCLUDED_BRANDS
+    )
+    selected_brand = st.selectbox("Search and Select a Brand:", options=[""] + all_brands, index=0)
+
+    if selected_brand:
+        st.markdown(f"### Showing comparison for: **{selected_brand}**")
+
+        dates_26 = bbd_dates(df26, BBD_RANGE_26)
+        dates_25 = bbd_dates(df25, BBD_RANGE_25)
+        max_days = max(len(dates_26), len(dates_25))
+
+        if max_days == 0:
+            st.info("No data in the BBD date windows.")
+        else:
+            headers = [
+                f"Day {i+1} ({fmt_date(dates_26[i]) if i < len(dates_26) else '-'}"
+                f" | {fmt_date(dates_25[i]) if i < len(dates_25) else '-'})"
+                for i in range(max_days)
+            ]
+
+            def get_brand_comparison(num_col, den_col):
+                d26 = brand_daily_disc(df26, selected_brand, dates_26, num_col, den_col)
+                d25 = brand_daily_disc(df25, selected_brand, dates_25, num_col, den_col)
+                row26 = {"Year": "2026"}
+                row25 = {"Year": "2025"}
+                for i, h in enumerate(headers):
+                    row26[h] = d26.get(dates_26[i], np.nan) if i < len(dates_26) else np.nan
+                    row25[h] = d25.get(dates_25[i], np.nan) if i < len(dates_25) else np.nan
+                return pd.DataFrame([row26, row25])
+
+            st.markdown("**Output ASP Disc%**")
+            st.dataframe(style_disc(get_brand_comparison('num_op_u', 'den_op_u'), 'Year'),
+                         use_container_width=True)
+
+            st.divider()
+
+            st.markdown("**Input ASP Disc%**")
+            st.dataframe(style_disc(get_brand_comparison('num_ip_u', 'den_ip_u'), 'Year'),
+                         use_container_width=True)
+
+            st.caption(f'{segment}  ·  "-" = no matched sales / day outside window  ·  '
+                       f'2026: {BBD_RANGE_26[0]}–{BBD_RANGE_26[1]}, 2025: {BBD_RANGE_25[0]}–{BBD_RANGE_25[1]}')
+    else:
+        st.info("Please select a brand from the dropdown to view the comparison.")
