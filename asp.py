@@ -297,52 +297,64 @@ with tab10:
     render_sections(df25, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
     st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
 
+def bbd_all_days(dates_26, dates_25, max_days):
+    parts = []
+    for i in range(max_days):
+        t = bbd_day_table(i, dates_26, dates_25)
+        t.columns = pd.MultiIndex.from_product([[f'BBD D{i+1}'], t.columns])
+        parts.append(t)
+    full = pd.concat(parts, axis=1)
+    first_gmv = full.columns[4]                      # D1 'BBD GMV 26'
+    top  = full.loc[['Overall']]
+    rest = full.drop('Overall').sort_values(first_gmv, ascending=False, na_position='last')
+    return pd.concat([top, rest])
+
+
 with tab11:
     st.subheader("BBD Like-to-Like Comparison")
 
-    all_brands = sorted(
-        b for b in (set(df26['brand'].dropna().unique()) | set(df25['brand'].dropna().unique()))
-        if b.strip().lower() not in EXCLUDED_BRANDS
-    )
-    selected_brand = st.selectbox("Search and Select a Brand:", options=[""] + all_brands, index=0)
+    dates_26 = bbd_dates(df26, BBD_RANGE_26)
+    dates_25 = bbd_dates(df25, BBD_RANGE_25)
+    max_days = max(len(dates_26), len(dates_25))
 
-    if selected_brand:
-        st.markdown(f"### Showing comparison for: **{selected_brand}**")
-
-        dates_26 = bbd_dates(df26, BBD_RANGE_26)
-        dates_25 = bbd_dates(df25, BBD_RANGE_25)
-        max_days = max(len(dates_26), len(dates_25))
-
-        if max_days == 0:
-            st.info("No data in the BBD date windows.")
-        else:
-            headers = [
-                f"Day {i+1} ({fmt_date(dates_26[i]) if i < len(dates_26) else '-'}"
-                f" | {fmt_date(dates_25[i]) if i < len(dates_25) else '-'})"
-                for i in range(max_days)
-            ]
-
-            def get_brand_comparison(num_col, den_col):
-                d26 = brand_daily_disc(df26, selected_brand, dates_26, num_col, den_col)
-                d25 = brand_daily_disc(df25, selected_brand, dates_25, num_col, den_col)
-                row26 = {"Year": "2026"}
-                row25 = {"Year": "2025"}
-                for i, h in enumerate(headers):
-                    row26[h] = d26.get(dates_26[i], np.nan) if i < len(dates_26) else np.nan
-                    row25[h] = d25.get(dates_25[i], np.nan) if i < len(dates_25) else np.nan
-                return pd.DataFrame([row26, row25])
-
-            st.markdown("**Output ASP Disc%**")
-            st.dataframe(style_disc(get_brand_comparison('num_op_u', 'den_op_u'), 'Year'),
-                         use_container_width=True)
-
-            st.divider()
-
-            st.markdown("**Input ASP Disc%**")
-            st.dataframe(style_disc(get_brand_comparison('num_ip_u', 'den_ip_u'), 'Year'),
-                         use_container_width=True)
-
-            st.caption(f'{segment}  ·  "-" = no matched sales / day outside window  ·  '
-                       f'2026: {BBD_RANGE_26[0]}–{BBD_RANGE_26[1]}, 2025: {BBD_RANGE_25[0]}–{BBD_RANGE_25[1]}')
+    if max_days == 0:
+        st.info("No data in the BBD date windows.")
     else:
-        st.info("Please select a brand from the dropdown to view the comparison.")
+        all_brands = sorted(
+            b for b in (set(df26['brand'].dropna().unique()) | set(df25['brand'].dropna().unique()))
+            if b.strip().lower() not in EXCLUDED_BRANDS
+        )
+        picked = st.multiselect("Search brand (empty = all brands):", all_brands,
+                                placeholder="Type to search brand...")
+
+        t = bbd_all_days(dates_26, dates_25, max_days)
+        keep = ['Overall'] + (picked if picked else
+                              [b for b in t.index if b != 'Overall'
+                               and str(b).strip().lower() not in EXCLUDED_BRANDS])
+        t = t.loc[[b for b in keep if b in t.index]]
+        t.index.name = 'Brand'
+
+        disc_names = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25']
+        gmv_names  = ['BBD GMV 26', 'BBD GMV 25']
+        disc_cols  = [c for c in t.columns if c[1] in disc_names]
+        gmv_cols   = [c for c in t.columns if c[1] in gmv_names]
+
+        def color(v):
+            try:
+                f = float(v)
+                return "" if np.isnan(f) else (GREEN if f < 0 else RED)
+            except (TypeError, ValueError):
+                return ""
+
+        s = (t.style
+               .format('{:.0f}%', subset=pd.IndexSlice[:, disc_cols], na_rep='-')
+               .format('{:.1f}%', subset=pd.IndexSlice[:, gmv_cols],  na_rep='-'))
+        fn = s.map if hasattr(s, 'map') else s.applymap
+        st.dataframe(fn(color, subset=pd.IndexSlice[:, disc_cols]), use_container_width=True)
+
+        st.caption('Day windows: ' + '  ·  '.join(
+            f"D{i+1} = {fmt_date(dates_26[i]) if i < len(dates_26) else '-'}"
+            f" | {fmt_date(dates_25[i]) if i < len(dates_25) else '-'}"
+            for i in range(max_days)))
+        st.caption(f'{segment}  ·  BBD GMV = brand share of segment GMV that day  ·  '
+                   'sorted by D1 BBD GMV 26  ·  "-" = no matched sales / day outside window')
