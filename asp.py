@@ -22,8 +22,8 @@ NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gm
 TOP_N_BRANDS     = 100
 
 # BBD like-to-like windows (inclusive, YYYYMMDD strings)
-BBD_RANGE_26 = ('20261008', '20261231')
-BBD_RANGE_25 = ('20250922', '20251002')
+BBD_RANGE_26    = ('20261008', '20261231')
+BBD_RANGE_25    = ('20250922', '20251002')
 EXCLUDED_BRANDS = {'', 'unknown'}
 
 
@@ -233,10 +233,38 @@ def bbd_dates(df, rng):
     return sorted(d for d in df['date_'].unique() if rng[0] <= str(d) <= rng[1])
 
 
-def brand_daily_disc(df, brand, dates, num_col, den_col):
-    b   = df[(df['brand'] == brand) & (df['date_'].isin(dates))]
-    agg = b.groupby('date_').agg(num=(num_col, 'sum'), den=(den_col, 'sum'))
-    return (agg['num'] / agg['den'].replace(0, np.nan)) * 100   # NaN kept -> shown as '-'
+def bbd_day_table(day_idx, dates_26, dates_25):
+    cols = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25', 'BBD GMV 26', 'BBD GMV 25']
+
+    def agg(df, dates, sfx):
+        names = [f'I/P ASP {sfx}', f'O/P ASP {sfx}', f'BBD GMV {sfx}']
+        if day_idx >= len(dates):
+            return pd.DataFrame(columns=names)
+        g = df[df['date_'] == dates[day_idx]].groupby('brand').agg(
+            nop=('num_op_u', 'sum'), dop=('den_op_u', 'sum'),
+            nip=('num_ip_u', 'sum'), dip=('den_ip_u', 'sum'), gmv=('gmv', 'sum'))
+        g.loc['Overall'] = g.sum()          # share denominator = all brands
+        return pd.DataFrame({
+            names[0]: g['nip'] / g['dip'].replace(0, np.nan) * 100,
+            names[1]: g['nop'] / g['dop'].replace(0, np.nan) * 100,
+            names[2]: g['gmv'] / g.loc['Overall', 'gmv'] * 100,
+        })
+
+    t = agg(df26, dates_26, '26').join(agg(df25, dates_25, '25'), how='outer')[cols]
+    return t
+
+
+def bbd_all_days(dates_26, dates_25, max_days):
+    parts = []
+    for i in range(max_days):
+        t = bbd_day_table(i, dates_26, dates_25)
+        t.columns = pd.MultiIndex.from_product([[f'BBD D{i+1}'], t.columns])
+        parts.append(t)
+    full = pd.concat(parts, axis=1)
+    first_gmv = full.columns[4]                      # D1 'BBD GMV 26'
+    top  = full.loc[['Overall']]
+    rest = full.drop('Overall').sort_values(first_gmv, ascending=False, na_position='last')
+    return pd.concat([top, rest])
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -296,19 +324,6 @@ with tab10:
     st.subheader('Input ASP Disc% — Brand — 2025')
     render_sections(df25, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
     st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
-
-def bbd_all_days(dates_26, dates_25, max_days):
-    parts = []
-    for i in range(max_days):
-        t = bbd_day_table(i, dates_26, dates_25)
-        t.columns = pd.MultiIndex.from_product([[f'BBD D{i+1}'], t.columns])
-        parts.append(t)
-    full = pd.concat(parts, axis=1)
-    first_gmv = full.columns[4]                      # D1 'BBD GMV 26'
-    top  = full.loc[['Overall']]
-    rest = full.drop('Overall').sort_values(first_gmv, ascending=False, na_position='last')
-    return pd.concat([top, rest])
-
 
 with tab11:
     st.subheader("BBD Like-to-Like Comparison")
