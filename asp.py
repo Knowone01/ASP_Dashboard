@@ -19,7 +19,8 @@ EXTRA_BUCKETS     = [
 SEGMENT_OPTIONS  = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
 TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
 NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
-TOP_N_BRANDS     = 100
+TOP_N_BRANDS     = 100    # brand tabs 7-10
+TOP_N_BBD        = 1000   # BBD tab: shown by default, rest via search
 
 # BBD like-to-like windows (inclusive, YYYYMMDD strings)
 BBD_RANGE_26    = ('20261008', '20261231')
@@ -233,7 +234,7 @@ def bbd_dates(df, rng):
     return sorted(d for d in df['date_'].unique() if rng[0] <= str(d) <= rng[1])
 
 
-def bbd_day_table(day_idx, dates_26, dates_25):
+def bbd_day_table(day_idx, d26, d25, dates_26, dates_25):
     cols = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25', 'BBD GMV 26', 'BBD GMV 25']
 
     def agg(df, dates, sfx):
@@ -250,20 +251,27 @@ def bbd_day_table(day_idx, dates_26, dates_25):
             names[2]: g['gmv'] / g.loc['Overall', 'gmv'] * 100,
         })
 
-    t = agg(df26, dates_26, '26').join(agg(df25, dates_25, '25'), how='outer')[cols]
-    return t
+    return agg(d26, dates_26, '26').join(agg(d25, dates_25, '25'), how='outer')[cols]
 
 
-def bbd_all_days(dates_26, dates_25, max_days):
+@st.cache_data
+def bbd_all_days(seg):
+    d26, d25 = filter_segment(df_2026, seg), filter_segment(df_2025, seg)
+    dates_26, dates_25 = bbd_dates(d26, BBD_RANGE_26), bbd_dates(d25, BBD_RANGE_25)
+    max_days = max(len(dates_26), len(dates_25))
+    if max_days == 0:
+        return pd.DataFrame()
     parts = []
     for i in range(max_days):
-        t = bbd_day_table(i, dates_26, dates_25)
+        t = bbd_day_table(i, d26, d25, dates_26, dates_25)
         t.columns = pd.MultiIndex.from_product([[f'BBD D{i+1}'], t.columns])
         parts.append(t)
     full = pd.concat(parts, axis=1)
     first_gmv = full.columns[4]                      # D1 'BBD GMV 26'
     top  = full.loc[['Overall']]
-    rest = full.drop('Overall').sort_values(first_gmv, ascending=False, na_position='last')
+    rest = full.drop('Overall')
+    rest = rest[~rest.index.astype(str).str.strip().str.lower().isin(EXCLUDED_BRANDS)]
+    rest = rest.sort_values(first_gmv, ascending=False, na_position='last')
     return pd.concat([top, rest])
 
 
@@ -328,25 +336,24 @@ with tab10:
 with tab11:
     st.subheader("BBD Like-to-Like Comparison")
 
-    dates_26 = bbd_dates(df26, BBD_RANGE_26)
-    dates_25 = bbd_dates(df25, BBD_RANGE_25)
-    max_days = max(len(dates_26), len(dates_25))
+    full = bbd_all_days(segment)
 
-    if max_days == 0:
+    if full.empty:
         st.info("No data in the BBD date windows.")
     else:
-        all_brands = sorted(
-            b for b in (set(df26['brand'].dropna().unique()) | set(df25['brand'].dropna().unique()))
-            if b.strip().lower() not in EXCLUDED_BRANDS
-        )
-        picked = st.multiselect("Search brand (empty = all brands):", all_brands,
-                                placeholder="Type to search brand...")
+        dates_26 = bbd_dates(df26, BBD_RANGE_26)
+        dates_25 = bbd_dates(df25, BBD_RANGE_25)
+        max_days = max(len(dates_26), len(dates_25))
 
-        t = bbd_all_days(dates_26, dates_25, max_days)
-        keep = ['Overall'] + (picked if picked else
-                              [b for b in t.index if b != 'Overall'
-                               and str(b).strip().lower() not in EXCLUDED_BRANDS])
-        t = t.loc[[b for b in keep if b in t.index]]
+        all_brands = sorted(b for b in full.index if b != 'Overall')
+        picked = st.multiselect(
+            f"Search brand (empty = top {TOP_N_BBD} brands by D1 BBD GMV 26):",
+            all_brands, placeholder="Type to search brand...")
+
+        if picked:
+            t = full.loc[['Overall'] + picked]
+        else:
+            t = full.head(TOP_N_BBD + 1)          # Overall + top N
         t.index.name = 'Brand'
 
         disc_names = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25']
@@ -372,4 +379,5 @@ with tab11:
             f" | {fmt_date(dates_25[i]) if i < len(dates_25) else '-'}"
             for i in range(max_days)))
         st.caption(f'{segment}  ·  BBD GMV = brand share of segment GMV that day  ·  '
-                   'sorted by D1 BBD GMV 26  ·  "-" = no matched sales / day outside window')
+                   f'showing {"selected brands" if picked else f"top {TOP_N_BBD} brands"} '
+                   f'(sorted by D1 BBD GMV 26)  ·  "-" = no matched sales / day outside window')
