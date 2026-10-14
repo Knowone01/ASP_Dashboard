@@ -277,11 +277,11 @@ def bbd_all_days(seg):
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
-    'Output ASP 2026', 'Output ASP 2025',
-    'Input ASP 2026',  'Input ASP 2025',
+    'Output ASP 2026 (Vertical Level)', 'Output ASP 2025 (Vertical Level)',
+    'Input ASP 2026(Vertical Level)',  'Input ASP 2025 (Vertical Level)',
     'Output ASP (JA Bucket)', 'Input ASP (JA Bucket)',
-    'Output ASP Brand 2026', 'Output ASP Brand 2025',
-    'Input ASP Brand 2026',  'Input ASP Brand 2025',
+    'Output ASP 2026 (Brand Level)', 'Output ASP 2025 (Brand Level)',
+    'Input ASP 2026 (Brand Level)',  'Input ASP 2025 (Brand Level)',
     'BBD Like-to-Like'
 ])
 
