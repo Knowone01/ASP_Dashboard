@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from pathlib import Path
 
 pd.set_option("styler.render.max_elements", 50_000_000)
 
@@ -22,34 +23,21 @@ NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gm
 TOP_N_BRANDS     = 100    # brand tabs 7-10
 TOP_N_BBD        = 1000   # BBD tab: shown by default, rest via search
 
-# BBD like-to-like windows (inclusive, YYYYMMDD strings)
-BBD_RANGE_26    = ('20261008', '20261231')
-BBD_RANGE_25    = ('20250922', '20251002')
+# Like-to-like windows are inclusive; None means use the last date in that year's file.
+EVENT_WINDOWS = {
+    'BBD': {'2026': ('20261008', '20261018'), '2025': ('20250922', '20251002')},
+    'SPL': {'2026': ('20260924', '20261007'), '2025': ('20250908', '20250921')},
+    'BDS': {'2026': ('20261019', None), '2025': ('20251004', None)},
+}
+TOP_N_LTL = 1000
 EXCLUDED_BRANDS = {'', 'unknown'}
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
-@st.cache_data
-def load_csv(filepath):
-    df = pd.read_csv(filepath, dtype=str)
-    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_', regex=False)
-
-    for col in NUM_COLS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col].str.replace(',', '', regex=False), errors='coerce'
-            ).fillna(0).astype('float32')
-
-    df['date_']          = df['date_'].str.strip()
-    df['alpha_flag']     = df['alpha_flag'].str.strip().str.upper()
-    df['branded_flag']   = df['branded_flag'].str.strip()
-    df['super_category'] = df['super_category'].str.strip()
-    df['vertical']       = df['vertical'].str.strip()
-    df['ja_asp_bucket']  = df['ja_asp_bucket'].str.strip()
-    df['d1_asp_bucket']  = df['d1_asp_bucket'].str.strip()
-    df['brand']          = df['brand'].str.strip() if 'brand' in df.columns else ''
-
-    return df[df['super_category'].isin(TARGET_SUPERCATS)]
+@st.cache_data(show_spinner="Loading dashboard data...")
+def load_parquet(filepath, modified_time):
+    # modified_time makes Streamlit reload if the Parquet file changes.
+    return pd.read_parquet(filepath, engine="pyarrow")
 
 
 def fmt_date(d):
@@ -63,8 +51,17 @@ def fmt_date(d):
 st.sidebar.header("Filters")
 segment = st.sidebar.selectbox("Segment:", options=SEGMENT_OPTIONS)
 
-df_2026 = load_csv("data.csv")
-df_2025 = load_csv("data_2025.csv")
+BASE_DIR = Path(__file__).resolve().parent
+path_2026 = BASE_DIR / "data.parquet"
+path_2025 = BASE_DIR / "data_2025.parquet"
+
+for path in (path_2026, path_2025):
+    if not path.exists():
+        st.error(f"Missing {path.name}. Run: python convert_to_parquet.py")
+        st.stop()
+
+df_2026 = load_parquet(str(path_2026), path_2026.stat().st_mtime_ns)
+df_2025 = load_parquet(str(path_2025), path_2025.stat().st_mtime_ns)
 
 
 def filter_segment(df, seg):
@@ -229,60 +226,130 @@ def render_bucket_tab(num_col, den_col):
     )
 
 
-# ── BBD like-to-like helpers ──────────────────────────────────────────────────
-def bbd_dates(df, rng):
-    return sorted(d for d in df['date_'].unique() if rng[0] <= str(d) <= rng[1])
+# ── Event like-to-like comparisons ──────────────────────────────────────────
+def event_dates(df, window):
+    """Calendar dates, not just available rows, so a missing day never shifts pairs."""
+    start, end = window
+    if end is None:
+        available = df['date_'].dropna().astype(str)
+        available = available[available.str.fullmatch(r'\d{8}')]
+        if available.empty:
+            return []
+        end = available.max()
+    if end < start:
+        return []
+    return [d.strftime('%Y%m%d') for d in pd.date_range(
+        pd.to_datetime(start, format='%Y%m%d'),
+        pd.to_datetime(end, format='%Y%m%d'), freq='D')]
 
 
-def bbd_day_table(day_idx, d26, d25, dates_26, dates_25):
-    cols = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25', 'BBD GMV 26', 'BBD GMV 25']
+def event_day_table(d26, d25, date26, date25):
+    cols = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25',
+            'BBD GMV 26', 'BBD GMV 25']
 
-    def agg(df, dates, sfx):
-        names = [f'I/P ASP {sfx}', f'O/P ASP {sfx}', f'BBD GMV {sfx}']
-        if day_idx >= len(dates):
+    def agg(df, day, year):
+        names = [f'I/P ASP {year}', f'O/P ASP {year}', f'BBD GMV {year}']
+        if day is None:
             return pd.DataFrame(columns=names)
-        g = df[df['date_'] == dates[day_idx]].groupby('brand').agg(
+        sub = df[df['date_'] == day]
+        if sub.empty:
+            return pd.DataFrame(columns=names)
+        g = sub.groupby('brand').agg(
             nop=('num_op_u', 'sum'), dop=('den_op_u', 'sum'),
             nip=('num_ip_u', 'sum'), dip=('den_ip_u', 'sum'), gmv=('gmv', 'sum'))
-        g.loc['Overall'] = g.sum()          # share denominator = all brands
+        overall = g.sum()
+        g.loc['Overall'] = overall
         return pd.DataFrame({
             names[0]: g['nip'] / g['dip'].replace(0, np.nan) * 100,
             names[1]: g['nop'] / g['dop'].replace(0, np.nan) * 100,
-            names[2]: g['gmv'] / g.loc['Overall', 'gmv'] * 100,
+            names[2]: g['gmv'] / overall['gmv'] * 100 if overall['gmv'] else np.nan,
         })
 
-    return agg(d26, dates_26, '26').join(agg(d25, dates_25, '25'), how='outer')[cols]
+    return agg(d26, date26, '26').join(agg(d25, date25, '25'), how='outer').reindex(columns=cols)
 
 
-@st.cache_data
-def bbd_all_days(seg):
-    d26, d25 = filter_segment(df_2026, seg), filter_segment(df_2025, seg)
-    dates_26, dates_25 = bbd_dates(d26, BBD_RANGE_26), bbd_dates(d25, BBD_RANGE_25)
-    max_days = max(len(dates_26), len(dates_25))
-    if max_days == 0:
-        return pd.DataFrame()
+@st.cache_data(show_spinner='Preparing event comparison...')
+def event_all_days(event, seg, mtime26, mtime25):
+    d26 = filter_segment(df_2026, seg)
+    d25 = filter_segment(df_2025, seg)
+    dates26 = event_dates(df_2026, EVENT_WINDOWS[event]['2026'])
+    dates25 = event_dates(df_2025, EVENT_WINDOWS[event]['2025'])
     parts = []
-    for i in range(max_days):
-        t = bbd_day_table(i, d26, d25, dates_26, dates_25)
-        t.columns = pd.MultiIndex.from_product([[f'BBD D{i+1}'], t.columns])
+    for i in range(max(len(dates26), len(dates25))):
+        day26 = dates26[i] if i < len(dates26) else None
+        day25 = dates25[i] if i < len(dates25) else None
+        t = event_day_table(d26, d25, day26, day25)
+        t.columns = pd.MultiIndex.from_product([[f'{event} D{i+1}'], t.columns])
         parts.append(t)
+    if not parts:
+        return pd.DataFrame()
     full = pd.concat(parts, axis=1)
-    first_gmv = full.columns[4]                      # D1 'BBD GMV 26'
-    top  = full.loc[['Overall']]
+    if full.empty:
+        return full
+    if 'Overall' not in full.index:
+        full.loc['Overall'] = np.nan
+    top = full.loc[['Overall']]
     rest = full.drop('Overall')
     rest = rest[~rest.index.astype(str).str.strip().str.lower().isin(EXCLUDED_BRANDS)]
+    first_gmv = (f'{event} D1', 'BBD GMV 26')
     rest = rest.sort_values(first_gmv, ascending=False, na_position='last')
     return pd.concat([top, rest])
 
 
+def render_event(event):
+    st.subheader(f'{event} Like-to-Like Comparison')
+    dates26 = event_dates(df_2026, EVENT_WINDOWS[event]['2026'])
+    dates25 = event_dates(df_2025, EVENT_WINDOWS[event]['2025'])
+    full = event_all_days(event, segment,
+                          path_2026.stat().st_mtime_ns, path_2025.stat().st_mtime_ns)
+    if full.empty:
+        st.info(f'No data in the {event} comparison windows.')
+        return
+    all_brands = sorted(b for b in full.index if b != 'Overall')
+    picked = st.multiselect(
+        f'Search brand (empty = top {TOP_N_LTL} by D1 2026 GMV):',
+        all_brands, placeholder='Type to search brand...', key=f'{event}_brand_search')
+    t = full.loc[['Overall'] + picked].copy() if picked else full.head(TOP_N_LTL + 1).copy()
+    t.index.name = 'Brand'
+    disc_names = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25']
+    gmv_names = ['BBD GMV 26', 'BBD GMV 25']
+    disc_cols = [c for c in t.columns if c[1] in disc_names]
+    gmv_cols = [c for c in t.columns if c[1] in gmv_names]
+
+    def color(v):
+        try:
+            f = float(v)
+            return '' if np.isnan(f) else (GREEN if f < 0 else RED)
+        except (ValueError, TypeError):
+            return ''
+
+    styled = (t.style.format('{:.0f}%', subset=pd.IndexSlice[:, disc_cols], na_rep='-')
+                    .format('{:.1f}%', subset=pd.IndexSlice[:, gmv_cols], na_rep='-'))
+    fn = styled.map if hasattr(styled, 'map') else styled.applymap
+    st.dataframe(fn(color, subset=pd.IndexSlice[:, disc_cols]), use_container_width=True)
+    pairs = [
+        f'D{i+1}: {fmt_date(dates25[i]) if i < len(dates25) else "-"} 2025'
+        f' vs {fmt_date(dates26[i]) if i < len(dates26) else "-"} 2026'
+        for i in range(max(len(dates25), len(dates26)))
+    ]
+    with st.expander('View exact day-to-day date mapping', expanded=False):
+        st.write(' | '.join(pairs))
+    if len(dates25) != len(dates26):
+        st.warning(f'Different window lengths: {len(dates25)} days in 2025 and '
+                   f'{len(dates26)} days in 2026. Unpaired dates show as blank (-).')
+    st.caption(f'{segment} · BBD GMV = brand share of segment GMV that day · '
+               f'showing {"selected brands" if picked else f"top {TOP_N_LTL} brands"} '
+               '· sorted by D1 2026 GMV · - = no matched sales or unpaired day')
+
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs([
     'Output ASP 2026 (Vertical Level)', 'Output ASP 2025 (Vertical Level)',
     'Input ASP 2026(Vertical Level)',  'Input ASP 2025 (Vertical Level)',
     'Output ASP (JA Bucket)', 'Input ASP (JA Bucket)',
     'Output ASP 2026 (Brand Level)', 'Output ASP 2025 (Brand Level)',
     'Input ASP 2026 (Brand Level)',  'Input ASP 2025 (Brand Level)',
-    'BBD Like-to-Like'
+    'BBD Like-to-Like', 'SPL Like-to-Like', 'BDS Like-to-Like'
 ])
 
 with tab1:
@@ -334,50 +401,10 @@ with tab10:
     st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
 
 with tab11:
-    st.subheader("BBD Like-to-Like Comparison")
+    render_event('BBD')
 
-    full = bbd_all_days(segment)
+with tab12:
+    render_event('SPL')
 
-    if full.empty:
-        st.info("No data in the BBD date windows.")
-    else:
-        dates_26 = bbd_dates(df26, BBD_RANGE_26)
-        dates_25 = bbd_dates(df25, BBD_RANGE_25)
-        max_days = max(len(dates_26), len(dates_25))
-
-        all_brands = sorted(b for b in full.index if b != 'Overall')
-        picked = st.multiselect(
-            f"Search brand (empty = top {TOP_N_BBD} brands by D1 BBD GMV 26):",
-            all_brands, placeholder="Type to search brand...")
-
-        if picked:
-            t = full.loc[['Overall'] + picked]
-        else:
-            t = full.head(TOP_N_BBD + 1)          # Overall + top N
-        t.index.name = 'Brand'
-
-        disc_names = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25']
-        gmv_names  = ['BBD GMV 26', 'BBD GMV 25']
-        disc_cols  = [c for c in t.columns if c[1] in disc_names]
-        gmv_cols   = [c for c in t.columns if c[1] in gmv_names]
-
-        def color(v):
-            try:
-                f = float(v)
-                return "" if np.isnan(f) else (GREEN if f < 0 else RED)
-            except (TypeError, ValueError):
-                return ""
-
-        s = (t.style
-               .format('{:.0f}%', subset=pd.IndexSlice[:, disc_cols], na_rep='-')
-               .format('{:.1f}%', subset=pd.IndexSlice[:, gmv_cols],  na_rep='-'))
-        fn = s.map if hasattr(s, 'map') else s.applymap
-        st.dataframe(fn(color, subset=pd.IndexSlice[:, disc_cols]), use_container_width=True)
-
-        st.caption('Day windows: ' + '  ·  '.join(
-            f"D{i+1} = {fmt_date(dates_26[i]) if i < len(dates_26) else '-'}"
-            f" | {fmt_date(dates_25[i]) if i < len(dates_25) else '-'}"
-            for i in range(max_days)))
-        st.caption(f'{segment}  ·  BBD GMV = brand share of segment GMV that day  ·  '
-                   f'showing {"selected brands" if picked else f"top {TOP_N_BBD} brands"} '
-                   f'(sorted by D1 BBD GMV 26)  ·  "-" = no matched sales / day outside window')
+with tab13:
+    render_event('BDS')
