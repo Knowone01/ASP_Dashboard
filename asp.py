@@ -10,6 +10,13 @@ st.title('ASP Discount % Dashboard')
 
 GREEN = 'background-color: #d1e7dd; color: #0f5132'
 RED = 'background-color: #f8d7da; color: #842029'
+
+
+def discount_color(value):
+    if pd.isna(value):
+        return ''
+    return GREEN if value < 0 else RED
+
 TARGET = ['WomenWesternCore', 'WomenWesternGrowth']
 SEGMENTS = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
 METRICS = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'gmv']
@@ -126,9 +133,10 @@ def show_table(df, label):
         st.info(f'No {label} data for selected segment.')
         return
     p = df.set_index(label)
-    # Native dataframe formatting avoids Pandas Styler generating huge HTML/CSS tables.
-    st.dataframe(p, width='stretch', height=min(680, 38 * (len(p) + 1) + 5),
-                 column_config={c: st.column_config.NumberColumn(c, format='%.2f%%') for c in p.columns})
+    # Style only the small table being displayed; never style raw data or cached summaries.
+    styled = p.style.format('{:.2f}%', na_rep='-')
+    styled = styled.map(discount_color)
+    st.dataframe(styled, width='stretch', height=min(680, 38 * (len(p) + 1) + 5))
 
 
 def sections(year, segment, num, den, section_list):
@@ -176,7 +184,7 @@ def event_table(event, seg):
         df['day'] = df['date_'].map({date: f'{event} D{i+1}' for i, date in enumerate(dates)})
         values = df.pivot(index='brand', columns='day', values=['ip', 'op', 'share'])
         values.columns = pd.MultiIndex.from_tuples(
-            [(day, {'ip': 'I/P ASP', 'op': 'O/P ASP', 'share': 'BBD GMV'}[kind] + f' {year[-2:]}')
+            [(day, {'ip': 'I/P ASP', 'op': 'O/P ASP', 'share': f'{event} GMV'}[kind] + f' {year[-2:]}')
              for kind, day in values.columns])
         # Overall is calculated from all source rows, not only displayed brands.
         total = totals.copy()
@@ -187,7 +195,7 @@ def event_table(event, seg):
             row = total[total['date_'] == date]
             if not row.empty:
                 day = f'{event} D{i+1}'
-                for field, name in [('ip', 'I/P ASP'), ('op', 'O/P ASP'), ('share', 'BBD GMV')]:
+                for field, name in [('ip', 'I/P ASP'), ('op', 'O/P ASP'), ('share', f'{event} GMV')]:
                     values.loc['Overall', (day, f'{name} {year[-2:]}')] = row.iloc[0][field]
         return values
 
@@ -198,10 +206,10 @@ def event_table(event, seg):
         return full, dates26, dates25
     if 'Overall' not in full.index:
         full.loc['Overall'] = np.nan
-    second = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25', 'BBD GMV 26', 'BBD GMV 25']
+    second = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25', f'{event} GMV 26', f'{event} GMV 25']
     all_columns = pd.MultiIndex.from_product([[f'{event} D{i+1}' for i in range(max_days)], second])
     full = full.reindex(columns=all_columns)
-    rank_column = (f'{event} D1', 'BBD GMV 26')
+    rank_column = (f'{event} D1', f'{event} GMV 26')
     rest = full.drop(index='Overall').sort_values(rank_column, ascending=False, na_position='last')
     return pd.concat([full.loc[['Overall']], rest]), dates26, dates25
 
@@ -224,8 +232,14 @@ def show_event(event, seg):
                               placeholder='Type to find any brand...')
     displayed = full.loc[['Overall'] + selected].copy() if selected else full.head(TOP_N_LTL + 1).copy()
     displayed.index.name = 'Brand'
-    # MultiIndex columns stay intact; avoid expensive Styler HTML/CSS generation.
-    st.dataframe(displayed.round(1), width='stretch', height=620)
+    # Only style the displayed 300 brands (or searched brands), never the full event table.
+    # GMV share columns keep numeric formatting but do not get discount color coding.
+    discount_cols = [col for col in displayed.columns if col[1].startswith(('I/P ASP', 'O/P ASP'))]
+    gmv_cols = [col for col in displayed.columns if col[1].startswith(f'{event} GMV')]
+    styled = displayed.style.format('{:.0f}%', subset=discount_cols, na_rep='-')
+    styled = styled.format('{:.1f}%', subset=gmv_cols, na_rep='-')
+    styled = styled.map(discount_color, subset=discount_cols)
+    st.dataframe(styled, width='stretch', height=620)
     with st.expander('View exact day-to-day date mapping'):
         for i in range(max(len(dates25), len(dates26))):
             d25 = fmt_date(dates25[i]) if i < len(dates25) else '-'
