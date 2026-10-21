@@ -1,410 +1,277 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
+"""Memory-conscious ASP dashboard. Requires streamlit, pandas, numpy, pyarrow."""
 from pathlib import Path
+import gc
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-pd.set_option("styler.render.max_elements", 50_000_000)
+st.set_page_config(page_title='ASP Disc% Dashboard', layout='wide')
+st.title('ASP Discount % Dashboard')
 
-st.set_page_config(page_title="ASP Disc% Dashboard", layout="wide")
-st.title("ASP Discount % Dashboard")
-
-GREEN = "background-color: #d1e7dd; color: #0f5132"
-RED   = "background-color: #f8d7da; color: #842029"
-
-BUCKET_LABELS     = ['0-200', '200-300', '300-500', '500-1000', 'Above 1000']
-BUCKET_ORDER_FULL = ['0-200', '200-300', '0-300', '300-500', '500-1000', 'Above 500', 'Above 1000']
-EXTRA_BUCKETS     = [
-    ('0-300',     ['0-200', '200-300']),
-    ('Above 500', ['500-1000', 'Above 1000']),
-]
-SEGMENT_OPTIONS  = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
-TARGET_SUPERCATS = ['WomenWesternCore', 'WomenWesternGrowth']
-NUM_COLS         = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'units', 'gmv', 'mrp']
-TOP_N_BRANDS     = 100    # brand tabs 7-10
-TOP_N_BBD        = 1000   # BBD tab: shown by default, rest via search
-
-# Like-to-like windows are inclusive; None means use the last date in that year's file.
+GREEN = 'background-color: #d1e7dd; color: #0f5132'
+RED = 'background-color: #f8d7da; color: #842029'
+TARGET = ['WomenWesternCore', 'WomenWesternGrowth']
+SEGMENTS = ['Overall', 'Unbranded Non-Alpha', 'Branded Non-Alpha', 'Alpha']
+METRICS = ['num_op_u', 'den_op_u', 'num_ip_u', 'den_ip_u', 'gmv']
+BUCKET_ORDER = ['0-200', '200-300', '0-300', '300-500', '500-1000', 'Above 500', 'Above 1000']
+EXTRA_BUCKETS = [('0-300', ['0-200', '200-300']), ('Above 500', ['500-1000', 'Above 1000'])]
 EVENT_WINDOWS = {
     'BBD': {'2026': ('20261008', '20261018'), '2025': ('20250922', '20251002')},
     'SPL': {'2026': ('20260924', '20261007'), '2025': ('20250908', '20250921')},
     'BDS': {'2026': ('20261019', None), '2025': ('20251004', None)},
 }
-TOP_N_LTL = 1000
+TOP_N_LTL = 300
+TOP_N_BRANDS = 100
 EXCLUDED_BRANDS = {'', 'unknown'}
-
-
-# ── Data loading ──────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner="Loading dashboard data...")
-def load_parquet(filepath, modified_time):
-    # modified_time makes Streamlit reload if the Parquet file changes.
-    return pd.read_parquet(filepath, engine="pyarrow")
+BASE = Path(__file__).resolve().parent
+FILES = {'2025': BASE / 'data_2025.parquet', '2026': BASE / 'data.parquet'}
+for path in FILES.values():
+    if not path.exists():
+        st.error(f'Missing {path.name}. Run python convert_to_parquet.py first.')
+        st.stop()
 
 
 def fmt_date(d):
     try:
         return pd.to_datetime(str(d), format='%Y%m%d').strftime('%d %b')
-    except Exception:
+    except (ValueError, TypeError):
         return str(d)
 
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-st.sidebar.header("Filters")
-segment = st.sidebar.selectbox("Segment:", options=SEGMENT_OPTIONS)
-
-BASE_DIR = Path(__file__).resolve().parent
-path_2026 = BASE_DIR / "data.parquet"
-path_2025 = BASE_DIR / "data_2025.parquet"
-
-for path in (path_2026, path_2025):
-    if not path.exists():
-        st.error(f"Missing {path.name}. Run: python convert_to_parquet.py")
-        st.stop()
-
-df_2026 = load_parquet(str(path_2026), path_2026.stat().st_mtime_ns)
-df_2025 = load_parquet(str(path_2025), path_2025.stat().st_mtime_ns)
+def segment_filters(segment):
+    result = [('super_category', 'in', TARGET)]
+    if segment == 'Alpha':
+        result.append(('alpha_flag', '==', 'TRUE'))
+    elif segment == 'Branded Non-Alpha':
+        result += [('alpha_flag', '==', 'FALSE'), ('branded_flag', '==', 'Branded')]
+    elif segment == 'Unbranded Non-Alpha':
+        result += [('alpha_flag', '==', 'FALSE'), ('branded_flag', '==', 'Unbranded')]
+    return result
 
 
-def filter_segment(df, seg):
-    if seg == 'Overall':
-        return df
-    elif seg == 'Alpha':
-        return df[df['alpha_flag'] == 'TRUE']
-    elif seg == 'Branded Non-Alpha':
-        return df[(df['alpha_flag'] == 'FALSE') & (df['branded_flag'] == 'Branded')]
-    elif seg == 'Unbranded Non-Alpha':
-        return df[(df['alpha_flag'] == 'FALSE') & (df['branded_flag'] == 'Unbranded')]
-    return df
+@st.cache_data(show_spinner='Preparing compact summaries...', max_entries=5, ttl=1200)
+def grouped(year, segment, group_col, date_from, date_to, file_version):
+    """Never cache raw CSV/Parquet rows: only compressed grouped summaries."""
+    filters = segment_filters(segment)
+    if date_from:
+        filters.append(('date_', '>=', date_from))
+    if date_to:
+        filters.append(('date_', '<=', date_to))
+    cols = list(dict.fromkeys(['date_', group_col] + METRICS))
+    frame = pd.read_parquet(FILES[year], engine='pyarrow', columns=cols, filters=filters)
+    if frame.empty:
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=['date_'] + METRICS)
+    frame['date_'] = frame['date_'].astype(str)
+    frame[group_col] = frame[group_col].fillna('').astype(str).str.strip()
+    # Original overall totals exclude null/blank groups, but include unknown brands.
+    frame = frame[frame[group_col] != '']
+    for col in METRICS:
+        frame[col] = pd.to_numeric(frame[col], errors='coerce').fillna(0)
+    totals = frame.groupby('date_', sort=False, observed=True)[METRICS].sum().reset_index()
+    by_group = frame.groupby([group_col, 'date_'], sort=False, observed=True)[METRICS].sum().reset_index()
+    del frame
+    gc.collect()
+    return by_group, totals
 
-df26 = filter_segment(df_2026, segment)
-df25 = filter_segment(df_2025, segment)
 
-st.caption(f"Segment: **{segment}**  ·  Super categories: {', '.join(TARGET_SUPERCATS)}")
+def get_grouped(year, segment, group_col, start=None, end=None):
+    return grouped(year, segment, group_col, start, end, FILES[year].stat().st_mtime_ns)
 
 
-# ── Pivot builder ─────────────────────────────────────────────────────────────
-def make_pivot(data, group_col, label_col, num_col, den_col,
-               sort_by_gmv=False, sort_order=None, extra_buckets=None):
-    sub = data.dropna(subset=[group_col])
-    sub = sub[sub[group_col].str.strip() != '']
-    if sub.empty:
+def discount(df, num_col, den_col):
+    return (df[num_col] / df[den_col].replace(0, np.nan)).fillna(0) * 100
+
+
+def pivot_report(year, segment, group_col, label, num_col, den_col, order=None, top_brands=False, extras=None):
+    grouped_df, totals = get_grouped(year, segment, group_col)
+    if grouped_df.empty:
         return pd.DataFrame()
-
-    agg = (sub.groupby([group_col, 'date_'], as_index=False)
-              .agg(num=(num_col, 'sum'), den=(den_col, 'sum'), gmv=('gmv', 'sum')))
-    agg['disc'] = (agg['num'] / agg['den'].replace(0, np.nan)).fillna(0) * 100
-
-    pivot = agg.pivot(index=group_col, columns='date_', values='disc')
-    pivot.columns.name = None
-    pivot = pivot[sorted(pivot.columns)]
-    pivot.columns = [fmt_date(c) for c in pivot.columns]
-    pivot = pivot.reset_index().rename(columns={group_col: label_col})
-
-    # Derived bucket rows (computed from raw num/den, not from disc%)
-    if extra_buckets:
-        date_cols = [c for c in pivot.columns if c != label_col]
-        derived_rows = []
-        for extra_label, source_vals in extra_buckets:
-            src = sub[sub[group_col].isin(source_vals)]
-            if src.empty:
+    agg = grouped_df[[group_col, 'date_', num_col, den_col]].copy()
+    agg['disc'] = discount(agg, num_col, den_col)
+    p = agg.pivot(index=group_col, columns='date_', values='disc')
+    p = p.reindex(sorted(p.columns), axis=1)
+    p.columns = [fmt_date(c) for c in p.columns]
+    p.columns.name = None
+    p = p.reset_index().rename(columns={group_col: label})
+    date_cols = [c for c in p.columns if c != label]
+    if extras:
+        extra_rows = []
+        for name, source in extras:
+            subset = grouped_df[grouped_df[group_col].isin(source)]
+            if subset.empty:
                 continue
-            da = src.groupby('date_', as_index=False).agg(
-                num=(num_col, 'sum'), den=(den_col, 'sum')
-            )
-            da['disc'] = (da['num'] / da['den'].replace(0, np.nan)).fillna(0) * 100
-            row = {label_col: extra_label}
-            for _, r in da.iterrows():
-                d = fmt_date(r['date_'])
-                if d in date_cols:
-                    row[d] = r['disc']
-            derived_rows.append(row)
-        if derived_rows:
-            pivot = pd.concat([pivot, pd.DataFrame(derived_rows)], ignore_index=True)
-
-    # Row ordering
-    if sort_order is not None:
-        order_df = pd.DataFrame({label_col: [b for b in sort_order if b in pivot[label_col].values]})
-        pivot = order_df.merge(pivot, on=label_col, how='left')
-    elif sort_by_gmv:
-        gmv_order = (sub.groupby(group_col)['gmv'].sum().reset_index()
-                        .rename(columns={group_col: label_col})
-                        .sort_values('gmv', ascending=False))
-        if group_col == 'brand':
-            gmv_order = gmv_order.head(TOP_N_BRANDS)
-        pivot = gmv_order[[label_col]].merge(pivot, on=label_col, how='left')
-
-    # Overall row at top (computed from all rows, incl. brands beyond top N)
-    date_cols   = [c for c in pivot.columns if c != label_col]
-    overall_agg = sub.groupby('date_', as_index=False).agg(num=(num_col,'sum'), den=(den_col,'sum'))
-    overall_agg['disc'] = (overall_agg['num'] / overall_agg['den'].replace(0, np.nan)).fillna(0) * 100
-    overall_row = {label_col: 'Overall'}
-    for _, r in overall_agg.iterrows():
-        d = fmt_date(r['date_'])
-        if d in date_cols:
-            overall_row[d] = r['disc']
-    pivot = pd.concat([pd.DataFrame([overall_row]), pivot], ignore_index=True)
-
-    return pivot
+            by_day = subset.groupby('date_')[[num_col, den_col]].sum().reset_index()
+            by_day['disc'] = discount(by_day, num_col, den_col)
+            row = {label: name}
+            row.update({fmt_date(r['date_']): r['disc'] for _, r in by_day.iterrows()})
+            extra_rows.append(row)
+        if extra_rows:
+            p = pd.concat([p, pd.DataFrame(extra_rows)], ignore_index=True)
+    if order:
+        p = pd.DataFrame({label: [b for b in order if b in set(p[label])]}).merge(p, on=label, how='left')
+    elif top_brands or group_col == 'vertical':
+        gmv_order = grouped_df.groupby(group_col)['gmv'].sum().sort_values(ascending=False).index.tolist()
+        if top_brands:
+            gmv_order = gmv_order[:TOP_N_BRANDS]
+        p = pd.DataFrame({label: gmv_order}).merge(p, on=label, how='left')
+    totals = totals.copy()
+    totals['disc'] = discount(totals, num_col, den_col)
+    overall_row = {label: 'Overall'}
+    overall_row.update({fmt_date(r['date_']): r['disc'] for _, r in totals.iterrows() if fmt_date(r['date_']) in date_cols})
+    return pd.concat([pd.DataFrame([overall_row]), p], ignore_index=True)
 
 
-# ── Styler ────────────────────────────────────────────────────────────────────
-def style_disc(df, label_col):
-    df = df.set_index(label_col)
-    date_cols = df.columns.tolist()
-    def color(v):
-        try:
-            f = float(v)
-            if np.isnan(f):
-                return ""
-            return GREEN if f < 0 else RED
-        except (TypeError, ValueError):
-            return ""
-    s  = df.style.format({c: '{:.2f}%' for c in date_cols}, na_rep='-')
-    fn = s.map if hasattr(s, 'map') else s.applymap
-    return fn(color, subset=date_cols)
-
-
-# ── Section renderer ──────────────────────────────────────────────────────────
-def render_sections(data, sections, num_col, den_col):
-    """sections: list of (group_col, label_col, sort_by_gmv, sort_order[, extra_buckets])"""
-    if data.empty:
-        st.info(f'No data for **{segment}**.')
+def show_table(df, label):
+    if df.empty:
+        st.info(f'No {label} data for selected segment.')
         return
-    for i, section in enumerate(sections):
-        group_col, label_col, sort_by_gmv, sort_order = section[:4]
-        extra_buckets = section[4] if len(section) > 4 else None
-        pivot = make_pivot(data, group_col, label_col, num_col, den_col,
-                           sort_by_gmv, sort_order, extra_buckets)
-        if not pivot.empty:
-            st.markdown(f'**{label_col}**')
-            st.dataframe(style_disc(pivot, label_col), use_container_width=True)
-        else:
-            st.info(f'No {label_col} data for **{segment}**.')
-        if i < len(sections) - 1:
+    p = df.set_index(label)
+    # Native dataframe formatting avoids Pandas Styler generating huge HTML/CSS tables.
+    st.dataframe(p, width='stretch', height=min(680, 38 * (len(p) + 1) + 5),
+                 column_config={c: st.column_config.NumberColumn(c, format='%.2f%%') for c in p.columns})
+
+
+def sections(year, segment, num, den, section_list):
+    for idx, (group, label, order, top, extras) in enumerate(section_list):
+        st.markdown(f'**{label}**')
+        show_table(pivot_report(year, segment, group, label, num, den, order, top, extras), label)
+        if idx < len(section_list) - 1:
             st.divider()
 
 
-# ── Section definitions ───────────────────────────────────────────────────────
-SC_V_SECTIONS = [
-    ('super_category', 'Super Category', False, None),
-    ('vertical',       'Vertical',       True,  None),
-]
-
-BKT_SECTIONS = [
-    ('ja_asp_bucket', 'JA ASP Bucket', False, BUCKET_ORDER_FULL, EXTRA_BUCKETS),
-]
-
-BRAND_SECTIONS = [
-    ('brand', 'Brand', True, None),
-]
-
-
-# ── Bucket tab renderer ───────────────────────────────────────────────────────
-def render_bucket_tab(num_col, den_col):
-    SC = [('super_category', 'Super Category', False, None)]
-
-    st.markdown('**Super Category — 2026**')
-    render_sections(df26, SC, num_col, den_col)
-
-    st.divider()
-
-    st.markdown('**Super Category — 2025**')
-    render_sections(df25, SC, num_col, den_col)
-
-    st.divider()
-
-    st.markdown('**JA ASP Bucket — 2026**')
-    render_sections(df26, BKT_SECTIONS, num_col, den_col)
-
-    st.divider()
-
-    st.markdown('**JA ASP Bucket — 2025**')
-    render_sections(df25, BKT_SECTIONS, num_col, den_col)
-
-    st.caption(
-        f'Disc% = {num_col} / {den_col} × 100  ·  {segment}  ·  '
-        '0-300 = sum(0-200, 200-300)  ·  500+ = sum(500-1000, Above 1000)'
-    )
-
-
-# ── Event like-to-like comparisons ──────────────────────────────────────────
-def event_dates(df, window):
-    """Calendar dates, not just available rows, so a missing day never shifts pairs."""
-    start, end = window
-    if end is None:
-        available = df['date_'].dropna().astype(str)
-        available = available[available.str.fullmatch(r'\d{8}')]
-        if available.empty:
-            return []
-        end = available.max()
-    if end < start:
+def calendar_dates(start, end, last_available):
+    end = end or last_available
+    if not end or end < start:
         return []
-    return [d.strftime('%Y%m%d') for d in pd.date_range(
-        pd.to_datetime(start, format='%Y%m%d'),
-        pd.to_datetime(end, format='%Y%m%d'), freq='D')]
+    return [d.strftime('%Y%m%d') for d in pd.date_range(start=start, end=end, freq='D')]
 
 
-def event_day_table(d26, d25, date26, date25):
-    cols = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25',
-            'BBD GMV 26', 'BBD GMV 25']
-
-    def agg(df, day, year):
-        names = [f'I/P ASP {year}', f'O/P ASP {year}', f'BBD GMV {year}']
-        if day is None:
-            return pd.DataFrame(columns=names)
-        sub = df[df['date_'] == day]
-        if sub.empty:
-            return pd.DataFrame(columns=names)
-        g = sub.groupby('brand').agg(
-            nop=('num_op_u', 'sum'), dop=('den_op_u', 'sum'),
-            nip=('num_ip_u', 'sum'), dip=('den_ip_u', 'sum'), gmv=('gmv', 'sum'))
-        overall = g.sum()
-        g.loc['Overall'] = overall
-        return pd.DataFrame({
-            names[0]: g['nip'] / g['dip'].replace(0, np.nan) * 100,
-            names[1]: g['nop'] / g['dop'].replace(0, np.nan) * 100,
-            names[2]: g['gmv'] / overall['gmv'] * 100 if overall['gmv'] else np.nan,
-        })
-
-    return agg(d26, date26, '26').join(agg(d25, date25, '25'), how='outer').reindex(columns=cols)
+def event_summary(year, segment, event):
+    start, end = EVENT_WINDOWS[event][year]
+    by_brand, overall = get_grouped(year, segment, 'brand', start, end)
+    valid = by_brand['date_'] if not by_brand.empty else overall['date_']
+    last_date = str(valid.max()) if len(valid) else None
+    # For open-ended BDS, use the last date available for this segment.
+    dates = calendar_dates(start, end, last_date)
+    if not by_brand.empty:
+        by_brand = by_brand[~by_brand['brand'].astype(str).str.lower().isin(EXCLUDED_BRANDS)].copy()
+    return by_brand, overall, dates
 
 
-@st.cache_data(show_spinner='Preparing event comparison...')
-def event_all_days(event, seg, mtime26, mtime25):
-    d26 = filter_segment(df_2026, seg)
-    d25 = filter_segment(df_2025, seg)
-    dates26 = event_dates(df_2026, EVENT_WINDOWS[event]['2026'])
-    dates25 = event_dates(df_2025, EVENT_WINDOWS[event]['2025'])
-    parts = []
-    for i in range(max(len(dates26), len(dates25))):
-        day26 = dates26[i] if i < len(dates26) else None
-        day25 = dates25[i] if i < len(dates25) else None
-        t = event_day_table(d26, d25, day26, day25)
-        t.columns = pd.MultiIndex.from_product([[f'{event} D{i+1}'], t.columns])
-        parts.append(t)
-    if not parts:
-        return pd.DataFrame()
-    full = pd.concat(parts, axis=1)
+def event_table(event, seg):
+    data26, all26, dates26 = event_summary('2026', seg, event)
+    data25, all25, dates25 = event_summary('2025', seg, event)
+    max_days = max(len(dates26), len(dates25))
+    if max_days == 0:
+        return pd.DataFrame(), dates26, dates25
+
+    def calc(df, totals, year, dates):
+        if df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        df['ip'] = discount(df, 'num_ip_u', 'den_ip_u').replace(0, 0)
+        df['op'] = discount(df, 'num_op_u', 'den_op_u').replace(0, 0)
+        gmvs = totals.set_index('date_')['gmv']
+        df['share'] = df['gmv'] / df['date_'].map(gmvs).replace(0, np.nan) * 100
+        df['day'] = df['date_'].map({date: f'{event} D{i+1}' for i, date in enumerate(dates)})
+        values = df.pivot(index='brand', columns='day', values=['ip', 'op', 'share'])
+        values.columns = pd.MultiIndex.from_tuples(
+            [(day, {'ip': 'I/P ASP', 'op': 'O/P ASP', 'share': 'BBD GMV'}[kind] + f' {year[-2:]}')
+             for kind, day in values.columns])
+        # Overall is calculated from all source rows, not only displayed brands.
+        total = totals.copy()
+        total['ip'] = discount(total, 'num_ip_u', 'den_ip_u')
+        total['op'] = discount(total, 'num_op_u', 'den_op_u')
+        total['share'] = np.where(total['gmv'].ne(0), 100., np.nan)
+        for i, date in enumerate(dates):
+            row = total[total['date_'] == date]
+            if not row.empty:
+                day = f'{event} D{i+1}'
+                for field, name in [('ip', 'I/P ASP'), ('op', 'O/P ASP'), ('share', 'BBD GMV')]:
+                    values.loc['Overall', (day, f'{name} {year[-2:]}')] = row.iloc[0][field]
+        return values
+
+    p26 = calc(data26, all26, '2026', dates26)
+    p25 = calc(data25, all25, '2025', dates25)
+    full = p26.join(p25, how='outer') if not p26.empty and not p25.empty else (p26 if p25.empty else p25)
     if full.empty:
-        return full
+        return full, dates26, dates25
     if 'Overall' not in full.index:
         full.loc['Overall'] = np.nan
-    top = full.loc[['Overall']]
-    rest = full.drop('Overall')
-    rest = rest[~rest.index.astype(str).str.strip().str.lower().isin(EXCLUDED_BRANDS)]
-    first_gmv = (f'{event} D1', 'BBD GMV 26')
-    rest = rest.sort_values(first_gmv, ascending=False, na_position='last')
-    return pd.concat([top, rest])
+    second = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25', 'BBD GMV 26', 'BBD GMV 25']
+    all_columns = pd.MultiIndex.from_product([[f'{event} D{i+1}' for i in range(max_days)], second])
+    full = full.reindex(columns=all_columns)
+    rank_column = (f'{event} D1', 'BBD GMV 26')
+    rest = full.drop(index='Overall').sort_values(rank_column, ascending=False, na_position='last')
+    return pd.concat([full.loc[['Overall']], rest]), dates26, dates25
 
 
-def render_event(event):
+@st.cache_data(show_spinner='Building event summary...', max_entries=3, ttl=1200)
+def cached_event(event, seg, v26, v25):
+    return event_table(event, seg)
+
+
+def show_event(event, seg):
     st.subheader(f'{event} Like-to-Like Comparison')
-    dates26 = event_dates(df_2026, EVENT_WINDOWS[event]['2026'])
-    dates25 = event_dates(df_2025, EVENT_WINDOWS[event]['2025'])
-    full = event_all_days(event, segment,
-                          path_2026.stat().st_mtime_ns, path_2025.stat().st_mtime_ns)
+    full, dates26, dates25 = cached_event(event, seg, FILES['2026'].stat().st_mtime_ns,
+                                           FILES['2025'].stat().st_mtime_ns)
     if full.empty:
-        st.info(f'No data in the {event} comparison windows.')
+        st.info('No data in this event window.')
         return
-    all_brands = sorted(b for b in full.index if b != 'Overall')
-    picked = st.multiselect(
-        f'Search brand (empty = top {TOP_N_LTL} by D1 2026 GMV):',
-        all_brands, placeholder='Type to search brand...', key=f'{event}_brand_search')
-    t = full.loc[['Overall'] + picked].copy() if picked else full.head(TOP_N_LTL + 1).copy()
-    t.index.name = 'Brand'
-    disc_names = ['I/P ASP 26', 'I/P ASP 25', 'O/P ASP 26', 'O/P ASP 25']
-    gmv_names = ['BBD GMV 26', 'BBD GMV 25']
-    disc_cols = [c for c in t.columns if c[1] in disc_names]
-    gmv_cols = [c for c in t.columns if c[1] in gmv_names]
-
-    def color(v):
-        try:
-            f = float(v)
-            return '' if np.isnan(f) else (GREEN if f < 0 else RED)
-        except (ValueError, TypeError):
-            return ''
-
-    styled = (t.style.format('{:.0f}%', subset=pd.IndexSlice[:, disc_cols], na_rep='-')
-                    .format('{:.1f}%', subset=pd.IndexSlice[:, gmv_cols], na_rep='-'))
-    fn = styled.map if hasattr(styled, 'map') else styled.applymap
-    st.dataframe(fn(color, subset=pd.IndexSlice[:, disc_cols]), use_container_width=True)
-    pairs = [
-        f'D{i+1}: {fmt_date(dates25[i]) if i < len(dates25) else "-"} 2025'
-        f' vs {fmt_date(dates26[i]) if i < len(dates26) else "-"} 2026'
-        for i in range(max(len(dates25), len(dates26)))
-    ]
-    with st.expander('View exact day-to-day date mapping', expanded=False):
-        st.write(' | '.join(pairs))
+    brands = sorted((x for x in full.index if x != 'Overall'), key=str.casefold)
+    selected = st.multiselect('Search any brand (empty = top 300 by Day 1 2026 GMV):',
+                              options=brands, key=f'{event}_brand_search',
+                              placeholder='Type to find any brand...')
+    displayed = full.loc[['Overall'] + selected].copy() if selected else full.head(TOP_N_LTL + 1).copy()
+    displayed.index.name = 'Brand'
+    # MultiIndex columns stay intact; avoid expensive Styler HTML/CSS generation.
+    st.dataframe(displayed.round(1), width='stretch', height=620)
+    with st.expander('View exact day-to-day date mapping'):
+        for i in range(max(len(dates25), len(dates26))):
+            d25 = fmt_date(dates25[i]) if i < len(dates25) else '-'
+            d26 = fmt_date(dates26[i]) if i < len(dates26) else '-'
+            st.write(f'D{i+1}: {d25} 2025 vs {d26} 2026')
     if len(dates25) != len(dates26):
-        st.warning(f'Different window lengths: {len(dates25)} days in 2025 and '
-                   f'{len(dates26)} days in 2026. Unpaired dates show as blank (-).')
-    st.caption(f'{segment} · BBD GMV = brand share of segment GMV that day · '
-               f'showing {"selected brands" if picked else f"top {TOP_N_LTL} brands"} '
-               '· sorted by D1 2026 GMV · - = no matched sales or unpaired day')
+        st.warning(f'Unequal event lengths: {len(dates25)} days in 2025, {len(dates26)} days in 2026.')
+    st.caption(f'{seg} · GMV = brand share of segment GMV on each day · '
+               f'{"selected brands" if selected else "top 300 brands"} · ranked by Day 1 2026 GMV')
 
 
-# ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs([
+VIEWS = [
     'Output ASP 2026 (Vertical Level)', 'Output ASP 2025 (Vertical Level)',
-    'Input ASP 2026(Vertical Level)',  'Input ASP 2025 (Vertical Level)',
+    'Input ASP 2026 (Vertical Level)', 'Input ASP 2025 (Vertical Level)',
     'Output ASP (JA Bucket)', 'Input ASP (JA Bucket)',
     'Output ASP 2026 (Brand Level)', 'Output ASP 2025 (Brand Level)',
-    'Input ASP 2026 (Brand Level)',  'Input ASP 2025 (Brand Level)',
-    'BBD Like-to-Like', 'SPL Like-to-Like', 'BDS Like-to-Like'
-])
+    'Input ASP 2026 (Brand Level)', 'Input ASP 2025 (Brand Level)',
+    'BBD Like-to-Like', 'SPL Like-to-Like', 'BDS Like-to-Like',
+]
+st.sidebar.header('Filters')
+seg = st.sidebar.selectbox('Segment:', SEGMENTS)
+# A selector, rather than st.tabs, actually prevents non-selected views from executing.
+view = st.selectbox('Dashboard view', VIEWS, key='dashboard_view')
+st.caption(f'Segment: **{seg}** · Super categories: {", ".join(TARGET)}')
 
-with tab1:
-    st.subheader('Output ASP Disc% — 2026')
-    render_sections(df26, SC_V_SECTIONS, 'num_op_u', 'den_op_u')
-    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  verticals sorted by GMV')
-
-with tab2:
-    st.subheader('Output ASP Disc% — 2025')
-    render_sections(df25, SC_V_SECTIONS, 'num_op_u', 'den_op_u')
-    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  verticals sorted by GMV')
-
-with tab3:
-    st.subheader('Input ASP Disc% — 2026')
-    render_sections(df26, SC_V_SECTIONS, 'num_ip_u', 'den_ip_u')
-    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  verticals sorted by GMV')
-
-with tab4:
-    st.subheader('Input ASP Disc% — 2025')
-    render_sections(df25, SC_V_SECTIONS, 'num_ip_u', 'den_ip_u')
-    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  verticals sorted by GMV')
-
-with tab5:
-    st.subheader('Output ASP Disc% — JA ASP Bucket (Fixed by d-1 Units)')
-    render_bucket_tab('num_op_u', 'den_op_u')
-
-with tab6:
-    st.subheader('Input ASP Disc% — JA ASP Bucket (Fixed by JA Units)')
-    render_bucket_tab('num_ip_u', 'den_ip_u')
-
-with tab7:
-    st.subheader('Output ASP Disc% — Brand — 2026')
-    render_sections(df26, BRAND_SECTIONS, 'num_op_u', 'den_op_u')
-    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
-
-with tab8:
-    st.subheader('Output ASP Disc% — Brand — 2025')
-    render_sections(df25, BRAND_SECTIONS, 'num_op_u', 'den_op_u')
-    st.caption(f'Disc% = num_op_u / den_op_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
-
-with tab9:
-    st.subheader('Input ASP Disc% — Brand — 2026')
-    render_sections(df26, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
-    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
-
-with tab10:
-    st.subheader('Input ASP Disc% — Brand — 2025')
-    render_sections(df25, BRAND_SECTIONS, 'num_ip_u', 'den_ip_u')
-    st.caption(f'Disc% = num_ip_u / den_ip_u × 100  ·  {segment}  ·  top {TOP_N_BRANDS} brands by GMV')
-
-with tab11:
-    render_event('BBD')
-
-with tab12:
-    render_event('SPL')
-
-with tab13:
-    render_event('BDS')
+if 'Like-to-Like' in view:
+    show_event(view.split()[0], seg)
+elif 'JA Bucket' in view:
+    num, den = ('num_op_u', 'den_op_u') if view.startswith('Output') else ('num_ip_u', 'den_ip_u')
+    for year in ['2026', '2025']:
+        st.subheader(f'Super Category — {year}')
+        sections(year, seg, num, den, [('super_category', 'Super Category', None, False, None)])
+        st.divider()
+    for year in ['2026', '2025']:
+        st.subheader(f'JA ASP Bucket — {year}')
+        sections(year, seg, num, den, [('ja_asp_bucket', 'JA ASP Bucket', BUCKET_ORDER, False, EXTRA_BUCKETS)])
+        st.divider()
+    st.caption(f'Disc% = {num} / {den} × 100 · Derived buckets use summed numerators/denominators')
+else:
+    year = '2026' if '2026' in view else '2025'
+    num, den = ('num_op_u', 'den_op_u') if view.startswith('Output') else ('num_ip_u', 'den_ip_u')
+    st.subheader(f'{"Output" if view.startswith("Output") else "Input"} ASP Disc% — {year}')
+    if 'Brand Level' in view:
+        sections(year, seg, num, den, [('brand', 'Brand', None, True, None)])
+        st.caption(f'Top {TOP_N_BRANDS} brands by GMV')
+    else:
+        sections(year, seg, num, den, [('super_category', 'Super Category', None, False, None),
+                                        ('vertical', 'Vertical', None, False, None)])
+    st.caption(f'Disc% = {num} / {den} × 100 · {seg}')
